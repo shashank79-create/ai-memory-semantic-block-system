@@ -4,7 +4,9 @@ Compares three ways of finding memories for a question:
 - keyword scan: the original notebook's approach (loop over every memory in the topic,
   count shared words)
 - brute-force embeddings: exact cosine similarity against every stored vector (numpy)
-- semantic_memory: SemanticMemoryStore.search on ChromaDB's vector index
+- semantic_memory with BlockIndexBackend (the default), searching all topics
+- semantic_memory with BlockIndexBackend, block-only (cross_topic=False)
+- semantic_memory with ChromaBackend (if chromadb is installed)
 
 Run: python benchmark.py            (sizes 100 1000 5000 10000)
      python benchmark.py 100 1000   (custom sizes)
@@ -21,13 +23,14 @@ import time
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-from semantic_memory import SemanticMemoryStore
+from semantic_memory import BlockIndexBackend, SemanticMemoryStore
 
 SUBJECTS = {
     "watches": ["Rolex", "Omega", "Seiko", "Casio", "Tudor", "Longines", "analog watch", "smartwatch"],
     "food": ["pizza", "sushi", "pasta", "biryani", "tacos", "ramen", "burgers", "dosa"],
     "travel": ["Goa", "Paris", "Tokyo", "a beach trip", "Manali", "a hotel in Rome", "Bali", "Dubai"],
     "technology": ["my laptop", "Python", "Android", "my iPhone", "Linux", "AI tools", "my code", "gadgets"],
+    "general": ["the weather", "my cousin", "a movie", "the news", "my gym", "a book"],
 }
 VERBS = ["I love", "I like", "I am curious about", "I bought", "I read about", "I talked about",
          "I want to try", "I dislike", "I compared", "I asked a friend about"]
@@ -82,39 +85,63 @@ def main(sizes):
     embed_ms = timed_ms(lambda: model.encode([f"fresh query {random.random()}"],
                                              normalize_embeddings=True), 20)
 
+    try:
+        from semantic_memory import ChromaBackend
+        import chromadb  # noqa: F401
+    except ImportError:
+        ChromaBackend = None
+
+    def fill(store, memories, vecs):
+        # Insert pre-computed vectors directly: this measures search, not insertion.
+        for start in range(0, len(memories), 1000):
+            chunk = range(start, min(start + 1000, len(memories)))
+            store.backend.add(
+                [f"m{i}" for i in chunk], [vecs[i].tolist() for i in chunk],
+                [{"user_id": "u", "topic": memories[i][0], "timestamp": "2026-01-01T00:00:00+00:00",
+                  "ts": 0.0, "importance": 1.0, "memory_type": "semantic", "deleted": False,
+                  "deleted_ts": 0.0, "version": 1} for i in chunk],
+                [memories[i][1] for i in chunk])
+        for q in QUERIES:  # warm the query embedding cache
+            store.search(q, "u")
+
+    def search_ms(store, **options):
+        return statistics.median(timed_ms(lambda q=q: store.search(q, "u", **options), 20) for q in QUERIES)
+
+    columns = ["Keyword scan (original)", "Brute-force numpy", "Blocks, all topics (default)",
+               "Blocks, block-only"] + (["ChromaDB"] if ChromaBackend else [])
     rows = []
     for n in sizes:
         memories, vecs = largest[:n], vectors[:n]
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-            store = SemanticMemoryStore(storage_path=tmp, embedder=model)
-            # Insert pre-computed vectors directly: this measures search, not insertion.
-            for start in range(0, n, 1000):
-                chunk = range(start, min(start + 1000, n))
-                store.backend.add(
-                    [f"m{i}" for i in chunk], [vecs[i].tolist() for i in chunk],
-                    [{"user_id": "u", "topic": memories[i][0], "timestamp": "2026-01-01T00:00:00+00:00",
-                      "ts": 0.0, "importance": 1.0, "memory_type": "semantic", "deleted": False,
-                      "deleted_ts": 0.0, "version": 1} for i in chunk],
-                    [memories[i][1] for i in chunk])
-            for q in QUERIES:  # warm the query cache and Chroma's index
-                store.search(q, "u")
-
-            kw = statistics.median(timed_ms(
-                lambda q=q: keyword_search(memories, q, store.classifier.classify(q)), 20) for q in QUERIES)
-            brute = statistics.median(timed_ms(
-                lambda qv=qv: np.argpartition(-(vecs @ qv), 5)[:5], 20) for qv in query_vecs)
-            ann = statistics.median(timed_ms(lambda q=q: store.search(q, "u"), 20) for q in QUERIES)
-            rows.append((n, kw, brute, ann))
-            print(f"  {n:>6} memories: keyword {kw:.2f} ms, brute-force {brute:.2f} ms, "
-                  f"semantic_memory {ann:.2f} ms", flush=True)
-            del store
+            blocks = SemanticMemoryStore(storage_path=tmp, embedder=model,
+                                         backend=BlockIndexBackend(f"{tmp}/memories.db"))
+            fill(blocks, memories, vecs)
+            row = [
+                statistics.median(timed_ms(
+                    lambda q=q: keyword_search(memories, q, blocks.classifier.classify(q)), 20)
+                    for q in QUERIES),
+                statistics.median(timed_ms(
+                    lambda qv=qv: np.argpartition(-(vecs @ qv), 5)[:5], 20) for qv in query_vecs),
+                search_ms(blocks),
+                search_ms(blocks, cross_topic=False),
+            ]
+            blocks.backend.close()
+            if ChromaBackend:
+                chroma = SemanticMemoryStore(storage_path=tmp, embedder=model,
+                                             backend=ChromaBackend(f"{tmp}/chroma"))
+                fill(chroma, memories, vecs)
+                row.append(search_ms(chroma))
+                del chroma
+            rows.append((n, row))
+            print(f"  {n:>6} memories: " + ", ".join(f"{c} {v:.2f} ms" for c, v in zip(columns, row)),
+                  flush=True)
 
     print(f"\nMachine: {platform.processor() or platform.machine()}, Python {platform.python_version()}")
     print(f"Embedding one new question with MiniLM: {embed_ms:.1f} ms (not included below)\n")
-    print("| Memories | Keyword scan (original) | Brute-force embeddings | semantic_memory search |")
-    print("|---:|---:|---:|---:|")
-    for n, kw, brute, ann in rows:
-        print(f"| {n:,} | {kw:.2f} ms | {brute:.2f} ms | {ann:.2f} ms |")
+    print("| Memories | " + " | ".join(columns) + " |")
+    print("|---:|" + "---:|" * len(columns))
+    for n, row in rows:
+        print(f"| {n:,} | " + " | ".join(f"{v:.2f} ms" for v in row) + " |")
 
 
 if __name__ == "__main__":

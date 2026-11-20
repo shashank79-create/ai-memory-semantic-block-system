@@ -1,8 +1,8 @@
-"""Tests for semantic_memory using an in-memory backend and a word-hash embedder.
+"""Tests for semantic_memory.
 
-These check the store's own logic (dedupe, expiry, scoring, stats, budgets). They do
-not exercise real ChromaDB or SentenceTransformers, so search quality on real text
-is not covered here.
+Store tests use a word-hash embedder and run on three backends: an in-memory stand-in,
+BlockIndexBackend (the default) and real ChromaDB (skipped if not installed). Tests
+marked "real" use the actual MiniLM and NLI models (skipped if unavailable).
 
 Run: python -m pytest test_semantic_memory.py
 """
@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 
 from semantic_memory import (
+    BlockIndexBackend,
     ChromaBackend,
     MemorySession,
     SemanticMemoryStore,
@@ -55,10 +56,14 @@ def _matches(meta: dict, where) -> bool:
     value = meta.get(key)
     if isinstance(cond, dict):
         (op, target), = cond.items()
+        if op == "$in":
+            return value in target
+        if op == "$ne":
+            return value != target
         if value is None:
             return False
-        return {"$lt": value < target, "$lte": value <= target,
-                "$gt": value > target, "$eq": value == target}[op]
+        return {"$lt": value < target, "$lte": value <= target, "$gt": value > target,
+                "$gte": value >= target, "$eq": value == target}[op]
     return value == cond
 
 
@@ -122,12 +127,14 @@ def clock():
     return Clock()
 
 
-@pytest.fixture(params=["fake", "chroma"])
+@pytest.fixture(params=["fake", "blocks", "chroma"])
 def store(request, tmp_path, clock):
-    """Every store test runs on the in-memory backend and, when installed, real ChromaDB."""
+    """Every store test runs on each backend (ChromaDB only when installed)."""
     if request.param == "chroma":
         pytest.importorskip("chromadb")
         backend = ChromaBackend(str(tmp_path / "chroma"))
+    elif request.param == "blocks":
+        backend = BlockIndexBackend(str(tmp_path / "memories.db"))
     else:
         backend = FakeBackend()
     return SemanticMemoryStore(storage_path=str(tmp_path), embedder=WordHashEmbedder(),
@@ -348,9 +355,7 @@ def minilm():
 
 @pytest.fixture
 def real_store(tmp_path, clock, minilm):
-    pytest.importorskip("chromadb")
-    return SemanticMemoryStore(storage_path=str(tmp_path), embedder=minilm,
-                               backend=ChromaBackend(str(tmp_path / "chroma")), clock=clock)
+    return SemanticMemoryStore(storage_path=str(tmp_path), embedder=minilm, clock=clock)
 
 
 def test_real_model_dedupes_rewording_but_keeps_negation(real_store):
@@ -480,3 +485,72 @@ def test_real_nli_contradictions(real_store, nli, old, new, replaced):
     expected = [new] if replaced else sorted([old, new])
     assert sorted(m.content for m in real_store.get_all("alice")) == expected
     assert first.id not in [m.id for m in real_store.get_all("alice")] or not replaced
+
+
+
+# ----- topic-block search and the block index backend -----------------------------
+
+def test_block_only_search_skips_other_topics(store):
+    store.add("rolex submariner is great", "alice", topic="watches")
+    store.add("rolex submariner shop visit", "alice", topic="travel")
+    store.add("rolex submariner notes", "alice", topic="general")
+    found = {m.topic for m in store.search("rolex submariner watch", "alice", cross_topic=False)}
+    assert found == {"watches", "general"}
+    found_all = {m.topic for m in store.search("rolex submariner watch", "alice")}
+    assert found_all == {"watches", "travel", "general"}
+
+
+def test_block_only_search_on_general_query_searches_everything(store):
+    store.add("rolex submariner is great", "alice", topic="watches")
+    found = store.search("rolex submariner", "alice", cross_topic=False, use_query_topic=False)
+    assert [m.topic for m in found] == ["watches"]
+
+
+def blocks_store(path, clock):
+    return SemanticMemoryStore(storage_path=str(path), embedder=WordHashEmbedder(),
+                               backend=BlockIndexBackend(str(path / "memories.db")), clock=clock)
+
+
+def test_block_backend_persists_across_restarts(tmp_path, clock):
+    first = blocks_store(tmp_path, clock)
+    keep = first.add("I love my Rolex Submariner", "alice")
+    gone = first.add("pizza is great", "alice")
+    first.soft_delete("alice", [gone.id])
+    first.backend.close()
+
+    second = blocks_store(tmp_path, clock)
+    assert [m.id for m in second.get_all("alice")] == [keep.id]
+    assert [m.id for m in second.search("rolex submariner", "alice")] == [keep.id]
+    assert second.restore("alice", [gone.id]) == 1
+    second.backend.close()
+
+
+def test_block_backend_delete_and_topic_move(tmp_path):
+    backend = BlockIndexBackend(str(tmp_path / "memories.db"))
+    vecs = np.eye(4, dtype=np.float32)
+    meta = lambda topic: {"user_id": "u", "topic": topic, "deleted": False}
+    backend.add(["a", "b", "c"], vecs[:3], [meta("x"), meta("x"), meta("x")], ["A", "B", "C"])
+    backend.delete(["a"])  # moves "c" into "a"'s slot
+    hit = backend.query([vecs[2]], 1, {"user_id": "u"})
+    assert hit["ids"] == [["c"]] and hit["distances"][0][0] == pytest.approx(0.0)
+    backend.update_metadata(["b"], [{"topic": "y"}])
+    assert backend.query([vecs[1]], 5, {"$and": [{"user_id": "u"}, {"topic": "y"}]})["ids"] == [["b"]]
+    assert backend.query([vecs[1]], 5, {"$and": [{"user_id": "u"}, {"topic": "x"}]})["ids"] == [["c"]]
+    assert backend.get(where={"topic": "y"})["metadatas"] == [{"user_id": "u", "topic": "y", "deleted": False}]
+    with pytest.raises(Exception):
+        backend.add(["b"], vecs[:1], [meta("x")], ["dup"])
+    backend.close()
+
+
+def test_block_backend_filters_widen_until_enough_results(tmp_path):
+    backend = BlockIndexBackend(str(tmp_path / "memories.db"))
+    rng = np.random.default_rng(0)
+    vecs = rng.normal(size=(200, 8)).astype(np.float32)
+    vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
+    # Only every 50th memory passes the filter, so the best-ranked ones mostly fail it.
+    metas = [{"user_id": "u", "topic": "t", "keep": i % 50 == 0} for i in range(200)]
+    backend.add([f"m{i}" for i in range(200)], vecs, metas, [str(i) for i in range(200)])
+    hits = backend.query([vecs[1]], 3, {"$and": [{"user_id": "u"}, {"keep": True}]})["ids"][0]
+    expected = sorted((i for i in range(0, 200, 50)), key=lambda i: -float(vecs[i] @ vecs[1]))[:3]
+    assert hits == [f"m{i}" for i in expected]
+    backend.close()

@@ -1,21 +1,24 @@
-"""Local semantic memory store backed by ChromaDB and SentenceTransformers.
+"""Local semantic memory store: SentenceTransformers embeddings in topic-block indexes.
 
-Install: pip install chromadb sentence-transformers tiktoken numpy
+Install: pip install sentence-transformers tiktoken numpy   (chromadb only for ChromaBackend)
 
 Notes:
-- Chroma cosine distance is (1 - cosine similarity). All similarity math uses that.
-- Chroma rejects `where` dicts with several top-level keys, so conditions are
-  combined with $and via `_where`.
+- The default BlockIndexBackend keeps one in-memory vector matrix per (user, topic)
+  block, saved in SQLite. Filtering by user and topic picks blocks instead of scanning
+  records, so searching one topic block only compares that block's vectors.
+  ChromaBackend (same interface) is an option for very large stores.
+- Backends use Chroma's conventions: cosine distance is (1 - cosine similarity), and
+  `where` dicts take one top-level key, so conditions are combined with $and via `_where`.
 - Expiry uses a numeric `ts` metadata field so deletion happens in one query.
   Records written before `ts` existed need `backfill_timestamps()` once.
 - Only episodic memories expire. Semantic memories (lasting facts) are kept until
   deleted. Restating a fact refreshes the stored copy instead of adding a new one.
 - Soft-deleted memories are removed for good by `purge_expired` once
   `deleted_grace_days` have passed, so `restore` works only within that window.
-- Topic filtering narrows results; it does not make search faster. Speed comes
-  from Chroma's vector index.
+- Search covers all topics by default. `cross_topic=False` searches only the query's
+  topic block plus "general", which is faster but can miss memories filed elsewhere.
 - Locks make dedupe and writes safe within one process. They do not coordinate
-  multiple processes sharing the same Chroma directory.
+  multiple processes sharing the same storage folder.
 - chromadb, sentence-transformers and tiktoken are imported only when needed, so
   a custom `embedder` and `backend` can be used without them (as the tests do).
 """
@@ -356,6 +359,250 @@ class ChromaBackend:
                 ids=ids[s:s + CHROMA_BATCH], metadatas=metadatas[s:s + CHROMA_BATCH]))
 
 
+def _flatten_where(where: Optional[dict]) -> List[Tuple[str, object]]:
+    """Turn a Chroma-style where dict into a flat list of (field, condition) pairs."""
+    if not where:
+        return []
+    if "$and" in where:
+        return [pair for sub in where["$and"] for pair in _flatten_where(sub)]
+    if len(where) != 1:
+        raise BackendError("where dicts take one top-level key; combine conditions with $and")
+    (field, cond), = where.items()
+    return [(field, cond)]
+
+
+_COMPARE = {
+    "$lt": lambda a, b: a < b, "$lte": lambda a, b: a <= b,
+    "$gt": lambda a, b: a > b, "$gte": lambda a, b: a >= b,
+}
+
+
+def _check(value, cond) -> bool:
+    if not isinstance(cond, dict):
+        return value == cond
+    (op, target), = cond.items()
+    if op == "$eq":
+        return value == target
+    if op == "$ne":
+        return value != target
+    if op == "$in":
+        return value in target
+    if op == "$nin":
+        return value not in target
+    if op in _COMPARE:
+        return value is not None and _COMPARE[op](value, target)
+    raise BackendError(f"unsupported where operator {op!r}")
+
+
+def _equal_values(conds: Sequence[Tuple[str, object]], field: str) -> Optional[set]:
+    """Values `field` is restricted to by equality/$in conditions, or None if unrestricted."""
+    allowed: Optional[set] = None
+    for name, cond in conds:
+        if name != field:
+            continue
+        if isinstance(cond, dict):
+            (op, target), = cond.items()
+            values = {target} if op == "$eq" else set(target) if op == "$in" else None
+        else:
+            values = {cond}
+        if values is not None:
+            allowed = values if allowed is None else allowed & values
+    return allowed
+
+
+class _Block:
+    """Vectors of one (user, topic) block in a growable float32 matrix."""
+
+    def __init__(self, dim: int):
+        self.ids: List[str] = []
+        self.pos: Dict[str, int] = {}
+        self._vecs = np.empty((16, dim), dtype=np.float32)
+
+    @property
+    def matrix(self) -> np.ndarray:
+        return self._vecs[:len(self.ids)]
+
+    def add(self, mem_id: str, vec: np.ndarray) -> None:
+        n = len(self.ids)
+        if n == len(self._vecs):
+            grown = np.empty((2 * n, self._vecs.shape[1]), dtype=np.float32)
+            grown[:n] = self._vecs
+            self._vecs = grown
+        self._vecs[n] = vec
+        self.pos[mem_id] = n
+        self.ids.append(mem_id)
+
+    def remove(self, mem_id: str) -> np.ndarray:
+        """Remove a vector (moving the last one into its slot) and return it."""
+        i = self.pos.pop(mem_id)
+        vec = self._vecs[i].copy()
+        last = len(self.ids) - 1
+        if i != last:
+            self._vecs[i] = self._vecs[last]
+            self.ids[i] = self.ids[last]
+            self.pos[self.ids[i]] = i
+        self.ids.pop()
+        return vec
+
+
+class BlockIndexBackend:
+    """Default backend: SQLite on disk, one in-memory vector matrix per (user, topic) block.
+
+    Searches are exact (every vector in the selected blocks is compared, using one
+    matrix multiply per block). Filters on user and topic pick blocks directly instead of
+    scanning records, so a search inside one topic block only touches that block. Other
+    filters (deleted, memory_type, ...) are checked only on the best matches, in order,
+    until enough are found.
+
+    Everything is loaded into memory at startup: about 1.5 KB per memory with MiniLM, so
+    100,000 memories use roughly 150 MB. For millions of memories, use ChromaBackend.
+    Same interface and Chroma-style results as ChromaBackend.
+    """
+
+    def __init__(self, path: str):
+        import json
+        import sqlite3
+        self._json = json
+        self._lock = threading.RLock()
+        try:
+            self._db = sqlite3.connect(str(path), check_same_thread=False)
+            self._db.execute("PRAGMA journal_mode=WAL")
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS memories (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, "
+                "topic TEXT NOT NULL, document TEXT NOT NULL, metadata TEXT NOT NULL, "
+                "embedding BLOB NOT NULL)")
+            rows = self._db.execute(
+                "SELECT id, document, metadata, embedding FROM memories ORDER BY rowid").fetchall()
+        except sqlite3.Error as exc:
+            raise BackendError(f"SQLite initialization failed: {exc}") from exc
+        self._meta: Dict[str, dict] = {}   # insertion ordered
+        self._docs: Dict[str, str] = {}
+        self._blocks: Dict[Tuple[str, str], _Block] = {}
+        self._dim: Optional[int] = None
+        for mem_id, doc, meta, emb in rows:
+            self._insert(mem_id, np.frombuffer(emb, dtype=np.float32), self._json.loads(meta), doc)
+
+    def close(self) -> None:
+        with self._lock:
+            self._db.close()
+
+    def _write(self, sql: str, rows: Sequence[tuple]) -> None:
+        import sqlite3
+        try:
+            with self._db:
+                self._db.executemany(sql, rows)
+        except sqlite3.Error as exc:
+            raise BackendError(f"SQLite write failed: {exc}") from exc
+
+    def _insert(self, mem_id: str, vec: np.ndarray, meta: dict, doc: str) -> None:
+        if self._dim is None:
+            self._dim = len(vec)
+        elif len(vec) != self._dim:
+            raise BackendError(f"embedding has {len(vec)} dimensions, expected {self._dim}")
+        key = (meta["user_id"], meta["topic"])
+        block = self._blocks.get(key)
+        if block is None:
+            block = self._blocks[key] = _Block(self._dim)
+        block.add(mem_id, vec)
+        self._meta[mem_id] = meta
+        self._docs[mem_id] = doc
+
+    def _select_blocks(self, conds) -> List[_Block]:
+        users, topics = _equal_values(conds, "user_id"), _equal_values(conds, "topic")
+        return [b for (u, t), b in self._blocks.items()
+                if (users is None or u in users) and (topics is None or t in topics) and b.ids]
+
+    def _matches(self, mem_id: str, conds) -> bool:
+        meta = self._meta[mem_id]
+        return all(_check(meta.get(field), cond) for field, cond in conds)
+
+    def add(self, ids, embeddings, metadatas, documents) -> None:
+        with self._lock:
+            dupes = [i for i in ids if i in self._meta]
+            if dupes or len(set(ids)) != len(ids):
+                raise BackendError(f"ids already exist: {dupes[:5]}")
+            vecs = [np.asarray(e, dtype=np.float32) for e in embeddings]
+            self._write(
+                "INSERT INTO memories (id, user_id, topic, document, metadata, embedding) VALUES (?,?,?,?,?,?)",
+                [(i, m["user_id"], m["topic"], d, self._json.dumps(m), v.tobytes())
+                 for i, v, m, d in zip(ids, vecs, metadatas, documents)])
+            for i, v, m, d in zip(ids, vecs, metadatas, documents):
+                self._insert(i, v, dict(m), d)
+
+    def query(self, embeddings: Sequence[Sequence[float]], k: int, where: dict) -> dict:
+        result = {key: [] for key in ("ids", "documents", "metadatas", "distances")}
+        conds = _flatten_where(where)
+        with self._lock:
+            blocks = self._select_blocks(conds) if k > 0 else []
+            for emb in embeddings:
+                hits = self._query_one(np.asarray(emb, dtype=np.float32), k, blocks, conds)
+                result["ids"].append([h[0] for h in hits])
+                result["distances"].append([1.0 - h[1] for h in hits])
+                result["metadatas"].append([dict(self._meta[h[0]]) for h in hits])
+                result["documents"].append([self._docs[h[0]] for h in hits])
+        return result
+
+    def _query_one(self, q: np.ndarray, k: int, blocks: List[_Block], conds) -> List[Tuple[str, float]]:
+        if not blocks:
+            return []
+        sims = np.concatenate([b.matrix @ q for b in blocks])
+        offsets = np.cumsum([0] + [len(b.ids) for b in blocks])
+        n = len(sims)
+        m = min(n, max(4 * k, 32))
+        while True:
+            # Sort only the best m, check filters in that order, and widen if too few pass.
+            top = np.argpartition(-sims, m - 1)[:m] if m < n else np.arange(n)
+            hits = []
+            for idx in top[np.argsort(-sims[top], kind="stable")]:
+                b = int(np.searchsorted(offsets, idx, side="right")) - 1
+                mem_id = blocks[b].ids[idx - offsets[b]]
+                if self._matches(mem_id, conds):
+                    hits.append((mem_id, float(sims[idx])))
+                    if len(hits) == k:
+                        return hits
+            if m == n:
+                return hits
+            m = min(n, 4 * m)
+
+    def get(self, where: Optional[dict] = None, ids: Optional[Sequence[str]] = None,
+            include: Tuple[str, ...] = ("documents", "metadatas"),
+            limit: Optional[int] = None, offset: int = 0) -> dict:
+        conds = _flatten_where(where)
+        with self._lock:
+            if ids is not None:
+                candidates = [i for i in dict.fromkeys(ids) if i in self._meta]
+            else:
+                users = _equal_values(conds, "user_id")
+                candidates = [i for i, m in self._meta.items() if users is None or m["user_id"] in users]
+            selected = [i for i in candidates if self._matches(i, conds)]
+            selected = selected[offset:None if limit is None else offset + limit]
+            return {"ids": selected,
+                    "documents": [self._docs[i] for i in selected],
+                    "metadatas": [dict(self._meta[i]) for i in selected]}
+
+    def delete(self, ids: Sequence[str]) -> None:
+        with self._lock:
+            ids = [i for i in dict.fromkeys(ids) if i in self._meta]
+            self._write("DELETE FROM memories WHERE id = ?", [(i,) for i in ids])
+            for i in ids:
+                meta = self._meta.pop(i)
+                self._docs.pop(i)
+                self._blocks[(meta["user_id"], meta["topic"])].remove(i)
+
+    def update_metadata(self, ids: Sequence[str], metadatas: Sequence[dict]) -> None:
+        with self._lock:
+            pairs = [(i, {**self._meta[i], **m}) for i, m in zip(ids, metadatas) if i in self._meta]
+            self._write("UPDATE memories SET user_id = ?, topic = ?, metadata = ? WHERE id = ?",
+                        [(m["user_id"], m["topic"], self._json.dumps(m), i) for i, m in pairs])
+            for i, merged in pairs:
+                old = self._meta[i]
+                if (old["user_id"], old["topic"]) != (merged["user_id"], merged["topic"]):
+                    vec = self._blocks[(old["user_id"], old["topic"])].remove(i)
+                    self._insert(i, vec, merged, self._docs[i])
+                else:
+                    self._meta[i] = merged
+
+
 class NLIContradictionChecker:
     """Asks a natural-language-inference model whether a new statement contradicts an old one.
 
@@ -418,7 +665,7 @@ class SemanticMemoryStore:
                   or getattr(self.embedder, "get_sentence_embedding_dimension", None))
         dim = dim_fn() if dim_fn else "unknown"
         self.model_key = f"{model_name}:{dim}"
-        self.backend = backend or ChromaBackend(str(self.storage_path / "chroma"))
+        self.backend = backend or BlockIndexBackend(str(self.storage_path / "memories.db"))
         self.classifier = TopicClassifier(topic_config or DEFAULT_TOPICS)
         self.ttl_days = ttl_days
         self.deleted_grace_days = deleted_grace_days
@@ -778,13 +1025,17 @@ class SemanticMemoryStore:
                alpha_recency: float = 0.2,
                min_similarity: float = DEFAULT_MIN_SIMILARITY,
                topic_min_similarity: float = DEFAULT_TOPIC_MIN_SIMILARITY,
-               use_query_topic: bool = True) -> List[Memory]:
+               use_query_topic: bool = True, cross_topic: bool = True) -> List[Memory]:
         """Return up to k memories, best first.
 
         Results below `min_similarity` are dropped, so an unrelated query returns nothing
         rather than filler. When `topic` is not given and `use_query_topic` is on, the
         query's own topic is detected; memories in that topic block are also searched
         and need only `topic_min_similarity`.
+
+        `cross_topic=False` searches only the query's topic block and the "general" block
+        (when a topic is detected). That is faster, but misses relevant memories filed
+        under other topics.
         """
         if k <= 0:
             return []
@@ -802,17 +1053,23 @@ class SemanticMemoryStore:
         if memory_type:
             conditions.append({"memory_type": memory_type})
         embedding = [self._embed_query(query).tolist()]
-        # Over-fetch so recency and importance can reorder more than the nearest k.
-        results = [self.backend.query(embedding, k * 3, _where(*conditions))]
         query_topic = None
         if topic is None and use_query_topic:
             detected = self.classifier.classify(query)
-            if detected != "general":
-                query_topic = detected
-                # The topic block gets its own query so its memories are found even
-                # when other topics fill the nearest results.
-                results.append(self.backend.query(
-                    embedding, k * 3, _where(*conditions, {"topic": query_topic})))
+            query_topic = detected if detected != "general" else None
+
+        # Over-fetch (k * 3) so recency and importance can reorder more than the nearest k.
+        if query_topic and not cross_topic:
+            # Block-only search: the query's topic block plus the "general" block.
+            # With BlockIndexBackend this compares only those blocks' vectors.
+            scopes = [{"topic": query_topic}, {"topic": "general"}]
+        else:
+            # All memories, plus the topic block on its own so its memories are found
+            # even when other topics fill the nearest results.
+            scopes = [None] + ([{"topic": query_topic}] if query_topic else [])
+        results = [self.backend.query(embedding, k * 3,
+                                      _where(*conditions, *([scope] if scope else [])))
+                   for scope in scopes]
 
         candidates: Dict[str, Tuple[float, str, dict]] = {}
         for result in results:
@@ -948,8 +1205,9 @@ class MemorySession:
         self.working.add(message)
 
     def search(self, query: str, topic: Optional[str] = None, memory_type: Optional[MemoryType] = None,
-               k: int = 5) -> List[Memory]:
-        return self._store.search(query, self.user_id, topic, memory_type, k)
+               k: int = 5, **options) -> List[Memory]:
+        """Search this user's memories; `options` go to SemanticMemoryStore.search."""
+        return self._store.search(query, self.user_id, topic, memory_type, k, **options)
 
     def get_all(self) -> List[Memory]:
         return self._store.get_all(self.user_id)
@@ -967,7 +1225,8 @@ class MemorySession:
         return self._store.stats(self.user_id, refresh)
 
     def build_context(self, query: str, topic: Optional[str] = None,
-                      token_budget: int = DEFAULT_TOKEN_BUDGET, include_working: bool = True) -> str:
+                      token_budget: int = DEFAULT_TOKEN_BUDGET, include_working: bool = True,
+                      cross_topic: bool = True) -> str:
         """Long-term memories plus recent messages, within `token_budget` tokens in total.
 
         Recent messages get up to a third of the budget; whatever they leave unused goes
@@ -981,7 +1240,8 @@ class MemorySession:
             if text:
                 working_section = header + text
         used = self._store.tokenizer.count(working_section) if working_section else 0
-        long_context = self.formatter.format(self.search(query, topic), token_budget - used)
+        long_context = self.formatter.format(self.search(query, topic, cross_topic=cross_topic),
+                                             token_budget - used)
         if not long_context:
             return working_section.lstrip("\n")
         return long_context + working_section
