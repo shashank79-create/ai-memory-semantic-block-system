@@ -45,7 +45,7 @@ What this shows:
 ## 🎯 How to Use
 1. Get a free Gemini API key from [aistudio.google.com](https://aistudio.google.com)
 2. Open the notebook in Jupyter (from this folder, so it can import `semantic_memory.py`)
-3. Run all cells and start chatting! The first cell installs the packages, and the first run downloads the embedding model (about 90 MB).
+3. Run all cells and start chatting! The first cell installs the packages, and the first run downloads two models: the embedding model (about 90 MB) and the contradiction model (about 300 MB).
 4. Save lasting facts with `assistant.remember("...")` and chat with `assistant.chat("...")`. Memories are kept in the `memory/` folder between sessions.
 
 ## 🧠 Semantic Memory Store (`semantic_memory.py`)
@@ -66,7 +66,7 @@ python -m pytest test_semantic_memory.py
 python benchmark.py
 ```
 
-Every store test runs on three backends: an in-memory stand-in, the topic-block backend and real ChromaDB. A few more tests check search and duplicates with the real MiniLM model. Tests needing ChromaDB or MiniLM are skipped when those aren't installed.
+Every store test runs on three backends: an in-memory stand-in, the topic-block backend and real ChromaDB. More tests use the real MiniLM and NLI models to check search, duplicates and contradictions. Tests needing ChromaDB or the models are skipped when those aren't available.
 
 The search cutoff (0.2) and duplicate threshold (0.985) were set from measured MiniLM scores. For example, "I am not allergic to peanuts" scores 0.970 against "I am allergic to peanuts", so it isn't treated as a duplicate.
 
