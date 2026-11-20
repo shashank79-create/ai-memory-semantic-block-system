@@ -81,7 +81,10 @@ DEFAULT_MAX_GAP: Optional[float] = 0.15
 # "I love sushi" 0.49). Changes worded very differently ("I live in Delhi" vs "I moved
 # to Mumbai", 0.62) are missed.
 CONTRADICTION_MIN_SIMILARITY = 0.80
-CONTRADICTION_CANDIDATES = 5     # stored memories checked per new memory
+# EmbeddingTopicClassifier: below this similarity to every topic's examples, a text is
+# "general". 0.35 gave the best topic accuracy on eval/dataset.json (78%; keywords: 75%).
+DEFAULT_TOPIC_CLASSIFIER_MIN_SIMILARITY = 0.35
+CONTRADICTION_CANDIDATES = 5    # stored memories checked per new memory
 DEFAULT_NLI_MODEL = "cross-encoder/nli-MiniLM2-L6-H768"
 RECENCY_HALF_LIFE_DAYS = 30.0    # recency score halves every 30 days
 DEFAULT_DELETED_GRACE_DAYS = 7
@@ -300,6 +303,67 @@ class TopicClassifier:
             if hits > best:
                 topic, best = name, hits
         return topic
+
+
+DEFAULT_TOPIC_EXAMPLES = {
+    "watches": [
+        "my wristwatch", "a luxury watch brand", "collecting watches", "mechanical and automatic watches",
+        "a smartwatch or fitness tracker on my wrist", "buying a new watch", "a vintage timepiece",
+        "watch dials, straps and movements",
+    ],
+    "food": [
+        "food I like to eat", "my diet and eating habits", "a food allergy or intolerance",
+        "cooking a recipe", "drinks like coffee or tea", "eating at a restaurant",
+        "a vegetarian or vegan diet", "desserts and sweets", "healthy eating and nutrition",
+        "breakfast, lunch and dinner", "a dish my family makes",
+    ],
+    "travel": [
+        "a trip I am planning", "countries and cities I have visited", "flights and airports",
+        "hotels and places to stay", "passport and visa", "a holiday destination",
+        "sightseeing abroad", "living in another country",
+    ],
+    "technology": [
+        "my laptop or computer", "my smartphone", "programming and writing code",
+        "learning a programming language", "software and apps", "building an AI project",
+        "gadgets and electronics", "fixing a broken device",
+    ],
+}
+
+
+class EmbeddingTopicClassifier:
+    """Picks the topic whose example phrases are most similar in meaning to the text.
+
+    Each topic is described by a few example phrases. A text goes to the topic with the
+    most similar example, or to "general" when no example reaches `min_similarity`.
+    Unlike keyword lists this catches wording the lists never mention ("timepiece",
+    "lactose intolerant"), and adding a topic needs only a few phrases.
+
+    It sorts topics slightly more accurately than the keyword lists but gives worse search
+    results with topic blocks (see SemanticMemoryStore's `topic_classifier`), so it is
+    not the default.
+    """
+
+    def __init__(self, embed: Callable[[Sequence[str]], np.ndarray],
+                 examples: Optional[Dict[str, Sequence[str]]] = None,
+                 min_similarity: float = DEFAULT_TOPIC_CLASSIFIER_MIN_SIMILARITY):
+        self._embed = embed
+        self.min_similarity = min_similarity
+        examples = examples or DEFAULT_TOPIC_EXAMPLES
+        self._labels = [topic for topic, phrases in examples.items() for _ in phrases]
+        self._vectors = embed([p for phrases in examples.values() for p in phrases])
+
+    def scores(self, text: str) -> Dict[str, float]:
+        """Best similarity to each topic's examples."""
+        sims = self._vectors @ self._embed([text])[0]
+        best: Dict[str, float] = {}
+        for label, sim in zip(self._labels, sims):
+            best[label] = max(best.get(label, -1.0), float(sim))
+        return best
+
+    def classify(self, text: str) -> str:
+        scores = self.scores(text)
+        topic = max(scores, key=scores.get)
+        return topic if scores[topic] >= self.min_similarity else "general"
 
 
 class ChromaBackend:
@@ -644,7 +708,8 @@ class SemanticMemoryStore:
                  cache_size: int = 1000, query_cache_size: int = 100, embedder=None, backend=None,
                  clock: Optional[Callable[[], datetime]] = None,
                  contradiction_checker: Optional[Callable[[Sequence[Tuple[str, str]]], List[bool]]] = None,
-                 contradiction_min_similarity: float = CONTRADICTION_MIN_SIMILARITY):
+                 contradiction_min_similarity: float = CONTRADICTION_MIN_SIMILARITY,
+                 topic_classifier="keyword"):
         """`contradiction_checker` (for example NLIContradictionChecker()) turns on replacing
         contradicted memories; without it, contradicting memories are both kept."""
         if ttl_days <= 0:
@@ -669,7 +734,6 @@ class SemanticMemoryStore:
         dim = dim_fn() if dim_fn else "unknown"
         self.model_key = f"{model_name}:{dim}"
         self.backend = backend or BlockIndexBackend(str(self.storage_path / "memories.db"))
-        self.classifier = TopicClassifier(topic_config or DEFAULT_TOPICS)
         self.ttl_days = ttl_days
         self.deleted_grace_days = deleted_grace_days
         self.contradiction_checker = contradiction_checker
@@ -683,6 +747,18 @@ class SemanticMemoryStore:
         self._write_lock = threading.RLock()
         self._stats_cache: Dict[str, Dict[str, int]] = {}
         self._stats_lock = threading.Lock()
+        # "keyword" (default) uses keyword lists (`topic_config`); "embedding" picks topics by
+        # meaning. Keywords are the default because they gave better search results in
+        # eval/retrieval_eval.py (74% vs 67% overall on the tuning set, after re-tuning the
+        # search settings for each). Any object with classify(text) -> topic also works.
+        if topic_classifier == "embedding":
+            # Shares the query cache, so a search embeds its question only once.
+            self.classifier = EmbeddingTopicClassifier(
+                lambda texts: self._embed_many(list(texts), self.query_cache))
+        elif topic_classifier == "keyword":
+            self.classifier = TopicClassifier(topic_config or DEFAULT_TOPICS)
+        else:
+            self.classifier = topic_classifier
 
     def _now(self) -> datetime:
         return self._clock()

@@ -570,3 +570,29 @@ def test_block_backend_filters_widen_until_enough_results(tmp_path):
     expected = sorted((i for i in range(0, 200, 50)), key=lambda i: -float(vecs[i] @ vecs[1]))[:3]
     assert hits == [f"m{i}" for i in expected]
     backend.close()
+
+
+
+# ----- embedding topic classifier ---------------------------------------------------
+
+def test_embedding_classifier_picks_closest_topic_or_general():
+    from semantic_memory import EmbeddingTopicClassifier
+    embed = lambda texts: WordHashEmbedder().encode(list(texts))
+    clf = EmbeddingTopicClassifier(embed, {"watches": ["rolex watch dial"], "food": ["pizza pasta dinner"]},
+                                   min_similarity=0.3)
+    assert clf.classify("my rolex dial") == "watches"
+    assert clf.classify("pasta for dinner") == "food"
+    assert clf.classify("the weather today") == "general"
+
+
+def test_store_accepts_embedding_or_custom_classifier(tmp_path, clock):
+    store = SemanticMemoryStore(storage_path=str(tmp_path), embedder=WordHashEmbedder(), backend=FakeBackend(),
+                                clock=clock, topic_classifier="embedding")
+    assert store.classifier.classify("my laptop computer") == "technology"
+
+    class Always:
+        def classify(self, text):
+            return "misc"
+    store = SemanticMemoryStore(storage_path=str(tmp_path), embedder=WordHashEmbedder(), backend=FakeBackend(),
+                                clock=clock, topic_classifier=Always())
+    assert store.add("anything", "alice").topic == "misc"

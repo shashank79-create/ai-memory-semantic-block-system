@@ -104,7 +104,7 @@ def score(results: dict, queries: list) -> dict:
 class Bench:
     """One set's memories in a real store, with every method available."""
 
-    def __init__(self, name: str, model):
+    def __init__(self, name: str, model, classifier: str = "keyword"):
         data = json.loads((ROOT / "eval" / SETS[name]).read_text(encoding="utf-8"))
         self.memories, self.queries = data["memories"], data["queries"]
         for q in self.queries:
@@ -112,7 +112,8 @@ class Bench:
         self.model = model
         self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.store = SemanticMemoryStore(storage_path=self._tmp.name, embedder=model,
-                                         backend=BlockIndexBackend(f"{self._tmp.name}/memories.db"))
+                                         backend=BlockIndexBackend(f"{self._tmp.name}/memories.db"),
+                                         topic_classifier=classifier)
         text_to_id = {text: mem_id for mem_id, text in self.memories.items()}
         stored = self.store.add_many(
             [{"content": t, "skip_duplicates": False} for t in self.memories.values()], "u")
@@ -171,7 +172,7 @@ def print_misses(bench: Bench, res: dict):
 
 def sweep(bench: Bench):
     grid = itertools.product([0.2, 0.25, 0.3, 0.35, 0.4],    # min_similarity
-                             [0.0, 0.1, 0.2, "same"],         # topic_min_similarity
+                             [0.0, 0.1, 0.15, 0.2, 0.25, "same"],  # topic_min_similarity
                              [None, 0.1, 0.15, 0.2, 0.25])    # max_gap
     rows = []
     for min_sim, topic_min, gap in grid:
@@ -192,19 +193,21 @@ def main():
     parser.add_argument("--sweep", action="store_true", help="try search settings on the tuning set")
     parser.add_argument("--set", choices=list(SETS), help="only this question set")
     parser.add_argument("--show-misses", metavar="METHOD", help="list questions this method got wrong")
+    parser.add_argument("--classifier", choices=["keyword", "embedding"], default="keyword",
+                        help="topic classifier the store uses (default: keyword, the store default)")
     args = parser.parse_args()
 
     from sentence_transformers import SentenceTransformer
     model = SentenceTransformer("all-MiniLM-L6-v2")
 
     if args.sweep:
-        bench = Bench("tuning", model)
+        bench = Bench("tuning", model, args.classifier)
         sweep(bench)
         bench.close()
         return
 
     for name in [args.set] if args.set else list(SETS):
-        bench = Bench(name, model)
+        bench = Bench(name, model, args.classifier)
         answerable = sum(1 for q in bench.queries if q["relevant"])
         print(f"\n## {name} set: {len(bench.memories)} memories, {answerable} answerable questions, "
               f"{len(bench.queries) - answerable} unrelated, k={K}")
