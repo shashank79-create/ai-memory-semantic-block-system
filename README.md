@@ -29,6 +29,31 @@ What this shows:
 - **Search is no longer a noticeable cost.** Embedding the question takes ~15 ms and a Gemini reply takes seconds. The main gain is still *which* memories are found.
 - The two raw baselines are faster at small sizes because they skip ranking, filtering and result building.
 
+## 🎯 Retrieval Quality
+Fast search is only useful if it finds the *right* memories. `eval/` holds two hand-written question sets, each with one user's memories and, for every question, the memories that would help answer it. Some questions are unrelated to the user (like "Who wrote Hamlet?") and should get no memories at all.
+
+- **Tuning set** (`eval/dataset.json`, 36 memories, 47 questions): used to choose the search settings.
+- **Held-out test set** (`eval/test_set.json`, 29 memories, 38 questions): written before any tuning and never used to pick settings. The scores below come from this set.
+
+Results on the held-out set (`python eval/retrieval_eval.py`, up to 5 memories per question):
+
+| Method | Recall | Precision | Hit rate | Rejects unrelated | Overall |
+|---|---:|---:|---:|---:|---:|
+| Keyword search (original notebook) | 40% | 18% | 45% | 0% | 20% |
+| Embeddings, top 5 (no cutoff) | 87% | 24% | 100% | 0% | 31% |
+| Embeddings + similarity cutoff | 68% | 73% | 84% | 100% | 76% |
+| **Embeddings + topic blocks (default)** | **77%** | **68%** | **94%** | **100%** | **77%** |
+
+- *Recall:* share of the relevant memories found. *Precision:* share of returned memories that were relevant. *Hit rate:* questions where at least one relevant memory was found. *Rejects unrelated:* unrelated questions that correctly got nothing. *Overall:* F1 of recall and precision, combined with rejection.
+
+What this shows:
+- **The redesign is ~4x better overall than the original** (77% vs 20%): it finds nearly twice as many relevant memories, and returns no memories for unrelated questions where the original returned irrelevant ones.
+- **Cutoffs matter as much as embeddings.** Plain top-5 embedding search finds the most (87%), but three out of four memories it returns are irrelevant, and it gives memories for every unrelated question.
+- **Topic blocks raise recall from 68% to 77%** and hit rate from 84% to 94%, at a small cost in precision (73% → 68%). They find memories the embedding model scores low, like the Rolex fact for "Which watch should I buy?".
+- **The topic classifier is now the weak point.** It's a keyword list: half the memories land in "general", "I'm lactose intolerant" isn't recognised as food, and "I'm allergic to cats" is filed under food. Picking topics with embeddings would be the next improvement.
+
+Settings were chosen with `python eval/retrieval_eval.py --sweep` on the tuning set: similarity cutoff 0.3, cutoff 0.1 inside the question's topic block, and a relative cutoff that drops results more than 0.15 below the best match (except topic-block memories). The sweep showed that sparing the topic block from the relative cutoff raised recall from 65% to 77% at the same rejection rate.
+
 ## 🛠️ Built With
 - Python
 - Google Gemini AI
@@ -41,6 +66,7 @@ What this shows:
 - `semantic_memory.py` - the memory store the notebook uses
 - `test_semantic_memory.py` - tests for the memory store
 - `benchmark.py` - search timing at different memory counts
+- `eval/` - retrieval quality test: question sets and `retrieval_eval.py`
 
 ## 🎯 How to Use
 1. Get a free Gemini API key from [aistudio.google.com](https://aistudio.google.com)
@@ -56,7 +82,7 @@ A standalone memory module that replaces the notebook's keyword search with embe
 - **Duplicates:** restating something refreshes the stored memory (time, importance, version) instead of adding a copy.
 - **Expiry:** only episodic memories (events) expire, after 90 days by default. Semantic memories (lasting facts) stay until deleted. Deleted memories can be restored for 7 days, then `purge_expired` removes them for good.
 - **Contradictions (optional):** pass `contradiction_checker=NLIContradictionChecker()` and a new memory that contradicts a very similar stored one replaces it ("I am not allergic to peanuts" replaces "I am allergic to peanuts"). The replaced memory is soft-deleted, so it can be restored for 7 days. The model alone would call "I love pizza" vs "I love sushi" a contradiction, so only pairs with similarity of at least 0.80 are checked. Changes worded very differently ("I live in Delhi" → "I moved to Mumbai") are missed.
-- **Ranking:** similarity, importance and recency, with a minimum similarity so unrelated memories aren't returned.
+- **Ranking:** similarity, importance and recency. A minimum similarity (0.3, or 0.1 inside the question's topic block) and a relative cutoff keep unrelated memories out.
 - **Context:** `MemorySession.build_context` fits long-term memories and recent messages into a token budget.
 
 ```bash
@@ -64,11 +90,12 @@ pip install sentence-transformers tiktoken numpy google-genai   # add chromadb f
 python semantic_memory.py          # small demo
 python -m pytest test_semantic_memory.py
 python benchmark.py
+python eval/retrieval_eval.py
 ```
 
 Every store test runs on three backends: an in-memory stand-in, the topic-block backend and real ChromaDB. More tests use the real MiniLM and NLI models to check search, duplicates and contradictions. Tests needing ChromaDB or the models are skipped when those aren't available.
 
-The search cutoff (0.2) and duplicate threshold (0.985) were set from measured MiniLM scores. For example, "I am not allergic to peanuts" scores 0.970 against "I am allergic to peanuts", so it isn't treated as a duplicate.
+The search settings come from the retrieval quality test above. The duplicate threshold (0.985) was set from measured MiniLM scores. For example, "I am not allergic to peanuts" scores 0.970 against "I am allergic to peanuts", so it isn't treated as a duplicate.
 
 ## 📫 Connect With Me
 - LinkedIn: [https://www.linkedin.com/in/shashank-yadav-142a42336]

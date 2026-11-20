@@ -302,9 +302,25 @@ def test_importance_above_one_in_old_records_is_clamped(store):
 def test_query_topic_block_finds_low_similarity_memories(store):
     store.add("Submariner bezel is ceramic", "alice", topic="watches")  # shares no words
     store.add("Pizza dough needs time", "alice", topic="food")
-    found = [m.content for m in store.search("which watch next", "alice")]
+    # Zero similarity: found only through the topic block, with its cutoff lowered to 0.
+    found = [m.content for m in store.search("which watch next", "alice", topic_min_similarity=0.0)]
     assert found == ["Submariner bezel is ceramic"]
-    assert store.search("which watch next", "alice", use_query_topic=False) == []
+    assert store.search("which watch next", "alice") == []  # default block cutoff is 0.1
+    assert store.search("which watch next", "alice", use_query_topic=False,
+                        topic_min_similarity=0.0) == []
+
+
+def test_relative_cutoff_drops_weak_matches_but_spares_topic_block(store):
+    store.add("rolex submariner bezel ceramic dial", "alice", topic="watches")
+    store.add("rolex dial", "alice", topic="watches")
+    store.add("rolex shop", "alice", topic="travel")
+    query = "rolex submariner bezel ceramic watch"
+    found = {m.content for m in store.search(query, "alice", min_similarity=0.2)}
+    # "rolex shop" (other topic) is far below the best match and is dropped;
+    # "rolex dial" is as weak but in the query's watches block, so it stays.
+    assert found == {"rolex submariner bezel ceramic dial", "rolex dial"}
+    found_no_gap = {m.content for m in store.search(query, "alice", min_similarity=0.2, max_gap=None)}
+    assert "rolex shop" in found_no_gap
 
 
 def test_general_query_uses_normal_cutoff(store):

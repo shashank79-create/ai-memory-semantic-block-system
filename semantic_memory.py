@@ -51,8 +51,8 @@ DEFAULT_TOPICS = {
              "breakfast", "cuisine", "recipe", "italian", "chinese", "mexican", "indian",
              "cook", "cooking", "meal", "eat", "snack", "peanut", "allergy", "allergic",
              "vegetarian", "vegan"],
-    "travel": ["trip", "hotel", "flight", "vacation", "beach", "travel", "holiday", "airport",
-               "passport", "visa"],
+    "travel": ["trip", "hotel", "flight", "vacation", "beach", "travel", "travelling", "traveling",
+               "travelled", "traveled", "holiday", "airport", "passport", "visa"],
     "technology": ["python", "ai", "laptop", "code", "phone", "computer", "app", "software",
                    "iphone", "android", "gadget", "programming"],
 }
@@ -62,15 +62,18 @@ DEFAULT_TOKEN_BUDGET = 512
 # "I am allergic to peanuts" vs "I am not allergic to peanuts" scores 0.970, so 0.97
 # would drop that correction. Contradictions below this are stored as separate memories.
 DUPLICATE_THRESHOLD = 0.985
-# Search drops results less similar than this. With MiniLM, related query/memory pairs
-# scored 0.23-0.63 ("What watches do I like?" vs "I love my Rolex Submariner" is 0.23)
-# and unrelated ones up to 0.17.
-DEFAULT_MIN_SIMILARITY = 0.2
-# Memories in the same topic block as the query use this cutoff instead. MiniLM scores
-# "Which watch should I buy?" vs "I love my Rolex Submariner" at only 0.15, and
+# Search settings, chosen on eval/dataset.json (python eval/retrieval_eval.py --sweep)
+# and checked on the held-out eval/test_set.json. With MiniLM, 36 memories put
+# unrelated questions above 0.2 ("Tell me a joke" vs "I'm vegetarian"), so 0.3 is used.
+DEFAULT_MIN_SIMILARITY = 0.3
+# Memories in the same topic block as the query use this lower cutoff instead. MiniLM
+# scores "Which watch should I buy?" vs "I love my Rolex Submariner" at only 0.15, and
 # "Suggest a dinner recipe" vs "I am allergic to peanuts" at 0.11; the shared topic
 # is what marks them as relevant.
-DEFAULT_TOPIC_MIN_SIMILARITY = 0.0
+DEFAULT_TOPIC_MIN_SIMILARITY = 0.1
+# Results less similar than (best match - DEFAULT_MAX_GAP) are dropped, except memories
+# in the query's topic block. None turns it off.
+DEFAULT_MAX_GAP: Optional[float] = 0.15
 # Only memories at least this similar to a new one are checked for contradictions.
 # Measured with MiniLM: "I love my Rolex" vs "I hate my Rolex" 0.87, "My favourite colour
 # is blue" vs "...green" 0.85, while compatible facts the NLI model still calls
@@ -1025,7 +1028,8 @@ class SemanticMemoryStore:
                alpha_recency: float = 0.2,
                min_similarity: float = DEFAULT_MIN_SIMILARITY,
                topic_min_similarity: float = DEFAULT_TOPIC_MIN_SIMILARITY,
-               use_query_topic: bool = True, cross_topic: bool = True) -> List[Memory]:
+               use_query_topic: bool = True, cross_topic: bool = True,
+               max_gap: Optional[float] = DEFAULT_MAX_GAP) -> List[Memory]:
         """Return up to k memories, best first.
 
         Results below `min_similarity` are dropped, so an unrelated query returns nothing
@@ -1080,10 +1084,20 @@ class SemanticMemoryStore:
 
         now = self._now()
         ranked = []
-        for mem_id, (similarity, doc, meta) in candidates.items():
-            in_block = query_topic is not None and meta.get("topic") == query_topic
-            if similarity < (topic_min_similarity if in_block else min_similarity):
-                continue
+        passing = {
+            mem_id: (similarity, doc, meta) for mem_id, (similarity, doc, meta) in candidates.items()
+            if similarity >= (topic_min_similarity
+                              if query_topic is not None and meta.get("topic") == query_topic
+                              else min_similarity)
+        }
+        if max_gap is not None and passing:
+            # Relative cutoff: drop results much less similar than the best match, except
+            # memories in the query's topic block (their own cutoff already applied).
+            best = max(similarity for similarity, _, _ in passing.values())
+            passing = {i: v for i, v in passing.items()
+                       if v[0] >= best - max_gap
+                       or (query_topic is not None and v[2].get("topic") == query_topic)}
+        for mem_id, (similarity, doc, meta) in passing.items():
             mem = self._memory(mem_id, doc, meta)
             # Importance is the caller's weight; age is counted once, through recency.
             recency = 2 ** (-_age_days(mem.timestamp, now) / RECENCY_HALF_LIFE_DAYS)
