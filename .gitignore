@@ -1,0 +1,5 @@
+__pycache__/
+.pytest_cache/
+memory/
+memory_data/
+.ipynb_checkpoints/
