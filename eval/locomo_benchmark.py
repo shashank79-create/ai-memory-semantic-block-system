@@ -16,9 +16,12 @@ Methods compared (all return a ranked list of turns):
 - BGE-small: BAAI/bge-small-en-v1.5 embeddings, a stronger small model
 - Hybrid BM25 + BGE: reciprocal rank fusion (k=60)
 - Hybrid + reranker: top 50 of the hybrid re-scored by cross-encoder/ms-marco-MiniLM-L-6-v2
-- semantic_memory default: SemanticMemoryStore.search with its default cutoffs
-- semantic_memory, ranking only: same store with cutoffs off, so topic blocks are the
-  only difference from plain MiniLM
+- semantic_memory default: the store's hybrid search (BGE + BM25 + reranker) with its
+  answer gate and relative cutoff, which can return fewer than 10 turns
+- semantic_memory hybrid, no gate: the same search returning its full top 10
+- semantic_memory classic: the previous design (MiniLM, topic blocks, cutoffs)
+- semantic_memory classic, ranking only: classic with cutoffs off, so topic blocks are
+  the only difference from plain MiniLM
 
 Metrics: Recall@k (share of evidence turns in the top k), Hit@k (at least one evidence
 turn in the top k), MRR@10. 95% confidence intervals by bootstrap over questions
@@ -48,7 +51,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "eval"))
 
 from retrieval_eval import keyword_method  # noqa: E402  (original notebook search)
-from semantic_memory import BlockIndexBackend, SemanticMemoryStore  # noqa: E402
+from semantic_memory import BlockIndexBackend, CrossEncoderReranker, SemanticMemoryStore  # noqa: E402
 
 DATA = ROOT / "eval" / "data" / "locomo10.json"
 DATA_URL = "https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json"
@@ -156,15 +159,17 @@ def paired_diff_ci(a: list, b: list, n: int = 2000, seed: int = 0) -> tuple:
 # ----- main -------------------------------------------------------------------------
 
 def main():
-    from sentence_transformers import CrossEncoder, SentenceTransformer
+    from sentence_transformers import SentenceTransformer
     data = load_locomo()
     minilm = SentenceTransformer("all-MiniLM-L6-v2")
     bge = SentenceTransformer("BAAI/bge-small-en-v1.5")
-    reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    store_reranker = CrossEncoderReranker()
+    reranker = store_reranker.model
 
     methods = ["Keyword search (original notebook)", "BM25", "MiniLM", "BGE-small",
                "Hybrid BM25 + BGE", "Hybrid + reranker",
-               "semantic_memory default", "semantic_memory, ranking only"]
+               "semantic_memory default", "semantic_memory hybrid, no gate",
+               "semantic_memory classic", "semantic_memory classic, ranking only"]
     per_q = {m: [] for m in methods}           # metric dicts, one per question
     timings = {m: [] for m in methods}         # seconds per question
     questions = []                             # (sample_id, category, question)
@@ -196,9 +201,15 @@ def main():
         tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         store = SemanticMemoryStore(storage_path=tmp.name, embedder=minilm,
                                     backend=BlockIndexBackend(f"{tmp.name}/memories.db"),
-                                    query_cache_size=4096)
+                                    query_cache_size=4096, reranker=None)
         created = store.add_many([{"content": t, "skip_duplicates": False} for t in texts], "u")
         to_dia = {m.id: d for m, d in zip(created, ids)}
+        hybrid_store = SemanticMemoryStore(storage_path=f"{tmp.name}/hybrid", embedder=bge,
+                                           backend=BlockIndexBackend(f"{tmp.name}/hybrid.db"),
+                                           query_cache_size=4096, reranker=store_reranker,
+                                           query_prefix=BGE_QUERY_PREFIX)
+        created = hybrid_store.add_many([{"content": t, "skip_duplicates": False} for t in texts], "u")
+        to_dia.update({m.id: d for m, d in zip(created, ids)})
 
         for q, gold in qs:
             question = q["question"]
@@ -241,14 +252,20 @@ def main():
                 return [ids[hybrid[j]] for j in np.argsort(-np.asarray(scores), kind="stable")]
             timed("Hybrid + reranker", do_rerank)
             timed("semantic_memory default", lambda: [
+                to_dia[m.id] for m in hybrid_store.search(question, "u", k=10)])
+            timed("semantic_memory hybrid, no gate", lambda: [
+                to_dia[m.id] for m in hybrid_store.search(question, "u", k=10, gate_similarity=None,
+                                                          gate_logit=None, relevance_gap=None)])
+            timed("semantic_memory classic", lambda: [
                 to_dia[m.id] for m in store.search(question, "u", k=10)])
-            timed("semantic_memory, ranking only", lambda: [
+            timed("semantic_memory classic, ranking only", lambda: [
                 to_dia[m.id] for m in store.search(question, "u", k=10, min_similarity=-1.0,
                                                    topic_min_similarity=-1.0, max_gap=None)])
             returned_counts.append(len(out["semantic_memory default"]))
             for name in methods:
                 per_q[name].append(metrics(out[name], gold))
         store.backend.close()
+        hybrid_store.backend.close()
         tmp.cleanup()
 
     # The hybrid/reranker timings include the BM25 and BGE searches they build on.
@@ -286,12 +303,15 @@ def main():
         print(f"| {name} | " + " | ".join(f"{v:.1%}" for v in vals) + " |")
 
     print("\nPaired differences in Recall@10 (95% CI; an interval excluding 0 is a real difference):\n")
-    pairs = [("semantic_memory, ranking only", "MiniLM", "Topic blocks vs plain MiniLM"),
-             ("semantic_memory default", "semantic_memory, ranking only", "Default cutoffs vs no cutoffs"),
+    pairs = [("semantic_memory default", "semantic_memory classic", "New default vs previous default (classic)"),
+             ("semantic_memory default", "semantic_memory hybrid, no gate", "Gate + relative cutoff vs none"),
+             ("semantic_memory hybrid, no gate", "Hybrid + reranker", "Store's hybrid vs the standalone baseline"),
+             ("semantic_memory classic, ranking only", "MiniLM", "Topic blocks vs plain MiniLM"),
+             ("semantic_memory classic", "semantic_memory classic, ranking only", "Classic cutoffs vs none"),
              ("BGE-small", "MiniLM", "BGE-small vs MiniLM"),
              ("Hybrid BM25 + BGE", "BGE-small", "Hybrid vs BGE-small"),
              ("Hybrid + reranker", "Hybrid BM25 + BGE", "Reranker vs hybrid"),
-             ("Hybrid + reranker", "semantic_memory default", "Best baseline vs semantic_memory default")]
+             ("BM25", "semantic_memory default", "BM25 vs new default")]
     diffs = {}
     for a, b, label in pairs:
         mean, lo, hi = paired_diff_ci([m["Recall@10"] for m in per_q[a]], [m["Recall@10"] for m in per_q[b]])

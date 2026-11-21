@@ -138,7 +138,7 @@ def store(request, tmp_path, clock):
     else:
         backend = FakeBackend()
     return SemanticMemoryStore(storage_path=str(tmp_path), embedder=WordHashEmbedder(),
-                               backend=backend, clock=clock)
+                               backend=backend, clock=clock, reranker=None)
 
 
 # ----- topic classification ---------------------------------------------------
@@ -369,9 +369,42 @@ def minilm():
         pytest.skip(f"MiniLM unavailable: {exc}")
 
 
+@pytest.fixture(scope="module")
+def bge():
+    st = pytest.importorskip("sentence_transformers")
+    try:
+        return st.SentenceTransformer("BAAI/bge-small-en-v1.5")
+    except Exception as exc:
+        pytest.skip(f"BGE unavailable: {exc}")
+
+
+@pytest.fixture(scope="module")
+def real_reranker():
+    pytest.importorskip("sentence_transformers")
+    from semantic_memory import CrossEncoderReranker
+    try:
+        return CrossEncoderReranker()
+    except Exception as exc:
+        pytest.skip(f"reranker unavailable: {exc}")
+
+
 @pytest.fixture
-def real_store(tmp_path, clock, minilm):
-    return SemanticMemoryStore(storage_path=str(tmp_path), embedder=minilm, clock=clock)
+def real_store(tmp_path, clock, bge, real_reranker):
+    """The default setup: BGE embeddings + BM25 + reranker (hybrid search)."""
+    from semantic_memory import BGE_QUERY_PREFIX
+    return SemanticMemoryStore(storage_path=str(tmp_path), embedder=bge, clock=clock,
+                               reranker=real_reranker, query_prefix=BGE_QUERY_PREFIX)
+
+
+@pytest.fixture
+def classic_store(tmp_path, clock, minilm):
+    """The previous design: MiniLM embeddings, topic blocks, cutoffs."""
+    return SemanticMemoryStore(storage_path=str(tmp_path), embedder=minilm, clock=clock, reranker=None)
+
+
+@pytest.fixture(params=["hybrid", "classic"])
+def either_store(request):
+    return request.getfixturevalue("real_store" if request.param == "hybrid" else "classic_store")
 
 
 def test_real_model_dedupes_rewording_but_keeps_negation(real_store):
@@ -388,23 +421,24 @@ def test_real_model_dedupes_rewording_but_keeps_negation(real_store):
     ("What computer do I use?", "My laptop is a ThinkPad running Linux"),
     ("Where am I travelling?", "I'm planning a beach vacation in Goa next month"),
 ])
-def test_real_model_finds_related_memories(real_store, query, expected):
+def test_real_model_finds_related_memories(either_store, query, expected):
     for text in ["I love my Rolex Submariner", "Neapolitan pizza is amazing",
                  "I am allergic to peanuts", "My laptop is a ThinkPad running Linux",
                  "I'm planning a beach vacation in Goa next month"]:
-        real_store.add(text, "alice")
-    assert expected in [m.content for m in real_store.search(query, "alice", k=3)]
+        either_store.add(text, "alice")
+    assert expected in [m.content for m in either_store.search(query, "alice", k=3)]
 
 
-def test_real_model_returns_nothing_for_unrelated_query(real_store):
+def test_real_model_returns_nothing_for_unrelated_query(either_store):
     for text in ["I love my Rolex Submariner", "Neapolitan pizza is amazing",
                  "My laptop is a ThinkPad running Linux"]:
-        real_store.add(text, "alice")
-    assert real_store.search("Tell me a joke", "alice") == []
-    assert real_store.search("What's the capital of France?", "alice") == []
+        either_store.add(text, "alice")
+    assert either_store.search("Tell me a joke", "alice") == []
+    assert either_store.search("What's the capital of France?", "alice") == []
 
 
-def test_real_model_brings_in_topic_block_memories(real_store):
+def test_real_model_brings_in_topic_block_memories(classic_store):
+    real_store = classic_store  # topic blocks only exist in classic search
     for text in ["I love my Rolex Submariner", "I prefer analog watches over smartwatches",
                  "I am allergic to peanuts", "Neapolitan pizza is my favourite food"]:
         real_store.add(text, "alice")
@@ -454,8 +488,9 @@ def test_dissimilar_memories_are_not_checked(checked_store):
 
 
 def test_compatible_similar_memories_are_kept(checked_store):
-    checked_store.add("my favourite watch brand is rolex", "alice")
-    mem = checked_store.add("my favourite watch brand is rolex and omega", "alice")
+    # Fake similarity 0.935: above the 0.90 contradiction gate, below the 0.96 duplicate one.
+    checked_store.add("my favourite watch brand is rolex submariner", "alice")
+    mem = checked_store.add("my favourite watch brand is rolex submariner too", "alice")
     assert checked_store.contradiction_checker.pairs  # was checked
     assert mem.replaced == ()
     assert len(checked_store.get_all("alice")) == 2
@@ -487,8 +522,10 @@ def nli():
 
 @pytest.mark.parametrize("old, new, replaced", [
     ("I am allergic to peanuts", "I am not allergic to peanuts", True),
-    ("I love my Rolex Submariner", "I hate my Rolex Submariner", True),
-    ("My favourite colour is blue", "My favourite colour is green", True),
+    # BGE scores these 0.815 and 0.866, below the 0.90 gate, so they are not checked:
+    # a known miss, chosen to avoid replacing compatible facts like "dog" vs "cat" (0.869).
+    ("I love my Rolex Submariner", "I hate my Rolex Submariner", False),
+    ("My favourite colour is blue", "My favourite colour is green", False),
     ("I have a dog", "I have a cat", False),
     ("I love pizza", "I love sushi", False),
     ("I work at Google", "I work at Google as an engineer", False),
@@ -523,7 +560,7 @@ def test_block_only_search_on_general_query_searches_everything(store):
 
 
 def blocks_store(path, clock):
-    return SemanticMemoryStore(storage_path=str(path), embedder=WordHashEmbedder(),
+    return SemanticMemoryStore(storage_path=str(path), embedder=WordHashEmbedder(), reranker=None,
                                backend=BlockIndexBackend(str(path / "memories.db")), clock=clock)
 
 
@@ -587,6 +624,7 @@ def test_embedding_classifier_picks_closest_topic_or_general():
 
 def test_store_accepts_embedding_or_custom_classifier(tmp_path, clock):
     store = SemanticMemoryStore(storage_path=str(tmp_path), embedder=WordHashEmbedder(), backend=FakeBackend(),
+                                reranker=None,
                                 clock=clock, topic_classifier="embedding")
     assert store.classifier.classify("my laptop computer") == "technology"
 
@@ -594,5 +632,119 @@ def test_store_accepts_embedding_or_custom_classifier(tmp_path, clock):
         def classify(self, text):
             return "misc"
     store = SemanticMemoryStore(storage_path=str(tmp_path), embedder=WordHashEmbedder(), backend=FakeBackend(),
+                                reranker=None,
                                 clock=clock, topic_classifier=Always())
     assert store.add("anything", "alice").topic == "misc"
+
+
+
+# ----- hybrid search (BM25 + embeddings + reranker) ---------------------------------
+
+class OverlapReranker:
+    """Fake reranker: relevance from the share of query words found in the memory."""
+
+    def __call__(self, query, documents):
+        words = set(re.findall(r"\w+", query.lower()))
+        out = []
+        for doc in documents:
+            share = len(words & set(re.findall(r"\w+", doc.lower()))) / max(len(words), 1)
+            out.append(1e-6 if share == 0 else 0.5 + 0.49 * share)
+        return np.array(out)
+
+
+@pytest.fixture(params=["fake", "blocks"])
+def hybrid_store(request, tmp_path, clock):
+    backend = FakeBackend() if request.param == "fake" else BlockIndexBackend(str(tmp_path / "memories.db"))
+    return SemanticMemoryStore(storage_path=str(tmp_path), embedder=WordHashEmbedder(), backend=backend,
+                               clock=clock, reranker=OverlapReranker())
+
+
+def test_hybrid_ranks_by_reranker(hybrid_store):
+    hybrid_store.add("rolex submariner diver", "alice", skip_duplicates=False)
+    hybrid_store.add("pizza margherita", "alice", skip_duplicates=False)
+    hybrid_store.add("rolex", "alice", skip_duplicates=False)
+    found = [m.content for m in hybrid_store.search("rolex submariner diver", "alice", relevance_gap=None)]
+    assert found == ["rolex submariner diver", "rolex", "pizza margherita"]
+
+
+def test_hybrid_finds_keyword_match_the_embedding_misses(tmp_path, clock):
+    class BlindEmbedder(WordHashEmbedder):
+        """Embeds every text the same way, so only BM25 can tell them apart."""
+        def encode(self, texts, **kw):
+            out = np.zeros((len(texts), DIM), dtype=np.float32)
+            out[:, 0] = 1.0
+            return out
+    store = SemanticMemoryStore(storage_path=str(tmp_path), embedder=BlindEmbedder(), backend=FakeBackend(),
+                                clock=clock, reranker=OverlapReranker())
+    for i in range(80):
+        store.add(f"filler memory number {i}", "alice", skip_duplicates=False)
+    store.add("my passport expires in March", "alice", skip_duplicates=False)
+    found = [m.content for m in store.search("passport", "alice", gate_similarity=None, gate_logit=None)]
+    assert found[0] == "my passport expires in March"
+
+
+def test_hybrid_gate_returns_nothing_for_unrelated_question(hybrid_store):
+    hybrid_store.add("rolex submariner diver", "alice")
+    assert hybrid_store.search("capital of france", "alice") == []
+    # Without the gate the same question gets the (irrelevant) memory back.
+    ungated = hybrid_store.search("capital of france", "alice", gate_similarity=None, gate_logit=None,
+                                  relevance_gap=None)
+    assert [m.content for m in ungated] == ["rolex submariner diver"]
+
+
+def test_hybrid_relevance_gap_drops_weak_matches(hybrid_store):
+    hybrid_store.add("rolex submariner diver watch", "alice", skip_duplicates=False)
+    hybrid_store.add("rolex shop", "alice", skip_duplicates=False)
+    query = "rolex submariner diver watch"
+    tight = [m.content for m in hybrid_store.search(query, "alice", relevance_gap=0.5, use_query_topic=False)]
+    loose = [m.content for m in hybrid_store.search(query, "alice", relevance_gap=None, use_query_topic=False)]
+    assert tight == ["rolex submariner diver watch"]
+    assert set(loose) == {"rolex submariner diver watch", "rolex shop"}
+    # Both are in the question's "watches" topic block, which skips the cutoff.
+    blocks = [m.content for m in hybrid_store.search(query, "alice", relevance_gap=0.5)]
+    assert set(blocks) == {"rolex submariner diver watch", "rolex shop"}
+
+
+def test_hybrid_respects_delete_restore_and_filters(hybrid_store, clock):
+    a = hybrid_store.add("passport expires in march", "alice", topic="travel")
+    hybrid_store.add("passport photo booth", "alice", topic="general")
+    hybrid_store.add("passport expires in march", "bob", topic="travel")
+    ask = lambda **kw: {m.id for m in hybrid_store.search("passport expires march", "alice",
+                                                          relevance_gap=None, **kw)}
+    assert a.id in ask()
+    assert all(m.user_id == "alice" for m in hybrid_store.search("passport", "alice", relevance_gap=None))
+    assert {m.topic for m in hybrid_store.search("passport", "alice", topic="general",
+                                                 relevance_gap=None)} == {"general"}
+    hybrid_store.soft_delete("alice", [a.id])
+    assert a.id not in ask()
+    hybrid_store.restore("alice", [a.id])
+    assert a.id in ask()
+    hybrid_store.soft_delete("alice", [a.id])
+    clock.advance(8)
+    hybrid_store.purge_expired("alice")
+    assert a.id not in ask()
+
+
+def test_bm25_index_built_from_existing_memories(tmp_path, clock):
+    first = SemanticMemoryStore(storage_path=str(tmp_path), embedder=WordHashEmbedder(),
+                                backend=BlockIndexBackend(str(tmp_path / "memories.db")),
+                                clock=clock, reranker=OverlapReranker())
+    mem = first.add("my passport expires in march", "alice")
+    first.backend.close()
+    second = SemanticMemoryStore(storage_path=str(tmp_path), embedder=WordHashEmbedder(),
+                                 backend=BlockIndexBackend(str(tmp_path / "memories.db")),
+                                 clock=clock, reranker=OverlapReranker())
+    assert [m.id for m in second.search("passport expires", "alice")] == [mem.id]
+    second.backend.close()
+
+
+def test_bm25_index_add_remove():
+    from semantic_memory import BM25Index
+    index = BM25Index()
+    index.add("a", "rolex submariner")
+    index.add("b", "pizza")
+    index.add("a", "ignored duplicate add")
+    assert [i for i, _ in index.top("rolex", 5)] == ["a"]
+    index.remove("a")
+    index.remove("missing")
+    assert index.top("rolex", 5) == [] and len(index) == 1
