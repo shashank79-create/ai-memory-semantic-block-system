@@ -57,14 +57,33 @@ DEFAULT_TOPICS = {
                    "iphone", "android", "gadget", "programming"],
 }
 DEFAULT_TOKEN_BUDGET = 512
-# Cosine similarity at or above this counts as a duplicate. Measured with MiniLM:
-# punctuation/case changes and "I really love X" score 0.99+, while
-# "I am allergic to peanuts" vs "I am not allergic to peanuts" scores 0.970, so 0.97
-# would drop that correction. Contradictions below this are stored as separate memories.
-DUPLICATE_THRESHOLD = 0.985
-# Search settings, chosen on eval/dataset.json (python eval/retrieval_eval.py --sweep)
-# and checked on the held-out eval/test_set.json. With MiniLM, 36 memories put
-# unrelated questions above 0.2 ("Tell me a joke" vs "I'm vegetarian"), so 0.3 is used.
+DEFAULT_EMBED_MODEL = "BAAI/bge-small-en-v1.5"
+# BGE retrieval models expect this prefix on search queries (not on stored memories).
+BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+DEFAULT_RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+RERANK_POOL = 50   # candidates from embeddings and BM25 that the reranker re-scores
+RRF_K = 60         # reciprocal rank fusion constant
+# Hybrid search settings (eval/retrieval_eval.py --sweep-hybrid on eval/dataset.json).
+# The reranker (trained on web search) gives personal memories tiny, poorly calibrated
+# relevance, so cutting individual memories by an absolute relevance loses many relevant
+# ones. Instead:
+# - Answer gate: a question gets memories only if its best embedding similarity or its
+#   best reranker logit clears these bars (unrelated questions like "Tell me a joke"
+#   clear neither). None turns the gate off.
+DEFAULT_GATE_SIMILARITY: Optional[float] = 0.6
+DEFAULT_GATE_LOGIT: Optional[float] = -9.5
+# - Relative cutoff: drop memories whose reranker logit is more than this below the best.
+DEFAULT_RELEVANCE_GAP: Optional[float] = 2.0
+DEFAULT_MIN_RELEVANCE = 0.0  # absolute cutoff on reranker relevance (0-1); off by default
+# Cosine similarity at or above this counts as a duplicate. Measured with BGE-small:
+# punctuation/case changes and "I really love X" score 0.97-1.0, while "I am allergic to
+# peanuts" vs "I am not allergic to peanuts" scores 0.923 and "I work at Google" vs
+# "I work at Google as an engineer" 0.934. Contradictions below this are stored separately.
+DUPLICATE_THRESHOLD = 0.96
+# Classic search (no reranker) settings below were chosen with MiniLM embeddings on
+# eval/dataset.json and checked on eval/test_set.json; they assume MiniLM similarities.
+# With MiniLM, 36 memories put unrelated questions above 0.2 ("Tell me a joke" vs
+# "I'm vegetarian"), so 0.3 is used.
 DEFAULT_MIN_SIMILARITY = 0.3
 # Memories in the same topic block as the query use this lower cutoff instead. MiniLM
 # scores "Which watch should I buy?" vs "I love my Rolex Submariner" at only 0.15, and
@@ -74,13 +93,14 @@ DEFAULT_TOPIC_MIN_SIMILARITY = 0.1
 # Results less similar than (best match - DEFAULT_MAX_GAP) are dropped, except memories
 # in the query's topic block. None turns it off.
 DEFAULT_MAX_GAP: Optional[float] = 0.15
-# Only memories at least this similar to a new one are checked for contradictions.
-# Measured with MiniLM: "I love my Rolex" vs "I hate my Rolex" 0.87, "My favourite colour
-# is blue" vs "...green" 0.85, while compatible facts the NLI model still calls
-# contradictions score lower ("I have a dog" vs "I have a cat" 0.77, "I love pizza" vs
-# "I love sushi" 0.49). Changes worded very differently ("I live in Delhi" vs "I moved
-# to Mumbai", 0.62) are missed.
-CONTRADICTION_MIN_SIMILARITY = 0.80
+# Only memories at least this similar to a new one are checked for contradictions,
+# because the NLI model also calls compatible facts contradictions ("I have a dog" vs
+# "I have a cat"). Measured with BGE-small, no cutoff separates them cleanly: real
+# contradictions score 0.82-0.92 ("I love my Rolex" vs "I hate my Rolex" 0.815,
+# "...allergic to peanuts" vs "...not allergic..." 0.923), compatible facts 0.76-0.88
+# ("dog" vs "cat" 0.869, "Paris" vs "Rome" 0.882). 0.90 is chosen to avoid deleting
+# compatible facts, at the cost of missing many contradictions.
+CONTRADICTION_MIN_SIMILARITY = 0.90
 # EmbeddingTopicClassifier: below this similarity to every topic's examples, a text is
 # "general". 0.35 gave the best topic accuracy on eval/dataset.json (78%; keywords: 75%).
 DEFAULT_TOPIC_CLASSIFIER_MIN_SIMILARITY = 0.35
@@ -364,6 +384,82 @@ class EmbeddingTopicClassifier:
         scores = self.scores(text)
         topic = max(scores, key=scores.get)
         return topic if scores[topic] >= self.min_similarity else "general"
+
+
+def _bm25_tokens(text: str) -> List[str]:
+    return re.findall(r"\w+", text.lower())
+
+
+class BM25Index:
+    """Incremental BM25 keyword index over one user's memories (k1=1.5, b=0.75)."""
+
+    def __init__(self, k1: float = 1.5, b: float = 0.75):
+        self.k1, self.b = k1, b
+        self._postings: Dict[str, Dict[str, int]] = {}
+        self._terms: Dict[str, List[str]] = {}
+        self._lengths: Dict[str, int] = {}
+        self._total = 0
+
+    def __len__(self) -> int:
+        return len(self._lengths)
+
+    def add(self, mem_id: str, text: str) -> None:
+        if mem_id in self._lengths:
+            return
+        counts = Counter(_bm25_tokens(text))
+        for term, tf in counts.items():
+            self._postings.setdefault(term, {})[mem_id] = tf
+        self._terms[mem_id] = list(counts)
+        self._lengths[mem_id] = sum(counts.values())
+        self._total += self._lengths[mem_id]
+
+    def remove(self, mem_id: str) -> None:
+        length = self._lengths.pop(mem_id, None)
+        if length is None:
+            return
+        self._total -= length
+        for term in self._terms.pop(mem_id):
+            docs = self._postings[term]
+            docs.pop(mem_id, None)
+            if not docs:
+                del self._postings[term]
+
+    def top(self, query: str, n: int) -> List[Tuple[str, float]]:
+        if not self._lengths or n <= 0:
+            return []
+        count = len(self._lengths)
+        avg = (self._total / count) or 1.0
+        scores: Dict[str, float] = {}
+        for term in set(_bm25_tokens(query)):
+            docs = self._postings.get(term)
+            if not docs:
+                continue
+            idf = math.log(1 + (count - len(docs) + 0.5) / (len(docs) + 0.5))
+            for mem_id, tf in docs.items():
+                norm = self.k1 * (1 - self.b + self.b * self._lengths[mem_id] / avg)
+                scores[mem_id] = scores.get(mem_id, 0.0) + idf * tf * (self.k1 + 1) / (tf + norm)
+        return sorted(scores.items(), key=lambda kv: -kv[1])[:n]
+
+
+class CrossEncoderReranker:
+    """Scores (query, memory) pairs with a cross-encoder; returns relevance in 0-1.
+
+    A cross-encoder reads the question and the memory together, which ranks far better
+    than comparing separate embeddings (+11.8 points Recall@10 on LoCoMo).
+    """
+
+    def __init__(self, model_name: str = DEFAULT_RERANK_MODEL):
+        try:
+            from sentence_transformers import CrossEncoder
+            self.model = CrossEncoder(model_name)
+        except Exception as exc:
+            raise EmbeddingError(f"Failed to load reranker {model_name!r}: {exc}") from exc
+
+    def __call__(self, query: str, documents: Sequence[str]) -> np.ndarray:
+        if not len(documents):
+            return np.zeros(0)
+        logits = np.asarray(self.model.predict([(query, d) for d in documents]), dtype=np.float64)
+        return 1.0 / (1.0 + np.exp(-logits.reshape(-1)))
 
 
 class ChromaBackend:
@@ -702,15 +798,25 @@ class NLIContradictionChecker:
 
 
 class SemanticMemoryStore:
-    def __init__(self, storage_path: str = "./memory", embed_model: str = "all-MiniLM-L6-v2",
+    def __init__(self, storage_path: str = "./memory", embed_model: str = DEFAULT_EMBED_MODEL,
                  topic_config: Optional[Dict[str, Sequence[str]]] = None, ttl_days: int = 90,
                  deleted_grace_days: int = DEFAULT_DELETED_GRACE_DAYS,
                  cache_size: int = 1000, query_cache_size: int = 100, embedder=None, backend=None,
                  clock: Optional[Callable[[], datetime]] = None,
                  contradiction_checker: Optional[Callable[[Sequence[Tuple[str, str]]], List[bool]]] = None,
                  contradiction_min_similarity: float = CONTRADICTION_MIN_SIMILARITY,
-                 topic_classifier="keyword"):
-        """`contradiction_checker` (for example NLIContradictionChecker()) turns on replacing
+                 topic_classifier="keyword", reranker="default",
+                 query_prefix: Optional[str] = None):
+        """Search mode depends on `reranker`:
+        - "default" or a reranker object: hybrid search. Embedding and BM25 keyword
+          candidates are merged, then re-scored by the reranker (see `search`).
+        - None: classic search. Embedding similarity with topic blocks and cutoffs tuned
+          for MiniLM (the original design; kept for comparison and for tests).
+
+        `query_prefix` is prepended to search queries before embedding; it defaults to the
+        BGE prefix when the BGE model is loaded by name.
+
+        `contradiction_checker` (for example NLIContradictionChecker()) turns on replacing
         contradicted memories; without it, contradicting memories are both kept."""
         if ttl_days <= 0:
             raise ValueError("ttl_days must be positive")
@@ -725,8 +831,16 @@ class SemanticMemoryStore:
             except Exception as exc:
                 raise EmbeddingError(f"Failed to load embedding model {embed_model!r}: {exc}") from exc
             model_name = embed_model
+            if query_prefix is None and "bge" in embed_model.lower():
+                query_prefix = BGE_QUERY_PREFIX
         else:
             model_name = type(embedder).__name__
+        self.query_prefix = query_prefix or ""
+        if reranker == "default":
+            reranker = CrossEncoderReranker()
+        self.reranker = reranker
+        self._bm25: Dict[str, BM25Index] = {}   # per user, built on first hybrid search
+        self._bm25_lock = threading.RLock()
         self.embedder = embedder
         # Newer sentence-transformers renamed the method; support both names.
         dim_fn = (getattr(self.embedder, "get_embedding_dimension", None)
@@ -795,7 +909,7 @@ class SemanticMemoryStore:
         return np.stack(out)
 
     def _embed_query(self, text: str) -> np.ndarray:
-        return self._embed_many([text], self.query_cache)[0]
+        return self._embed_many([self.query_prefix + text], self.query_cache)[0]
 
     # ----- helpers ----------------------------------------------------------
 
@@ -926,6 +1040,33 @@ class SemanticMemoryStore:
                 found.setdefault(i, []).append((mem_id, doc, meta))
         return found
 
+    def _bm25_for(self, user_id: str) -> BM25Index:
+        """The user's BM25 index, built from the store on first use, then kept in step."""
+        with self._bm25_lock:
+            index = self._bm25.get(user_id)
+            if index is None:
+                index = BM25Index()
+                found = self.backend.get(where=_where({"user_id": user_id}, {"deleted": False}),
+                                         include=("documents",))
+                for mem_id, doc in zip(found["ids"], found["documents"]):
+                    index.add(mem_id, doc)
+                self._bm25[user_id] = index
+            return index
+
+    def _bm25_add(self, user_id: str, pairs) -> None:
+        with self._bm25_lock:
+            index = self._bm25.get(user_id)
+            if index is not None:  # not built yet: it will load these on first use
+                for mem_id, doc in pairs:
+                    index.add(mem_id, doc)
+
+    def _bm25_remove(self, user_id: str, ids: Sequence[str]) -> None:
+        with self._bm25_lock:
+            index = self._bm25.get(user_id)
+            if index is not None:
+                for mem_id in ids:
+                    index.remove(mem_id)
+
     def _supersede(self, user_id: str, old: Sequence[Tuple[str, str, dict]], new_id: str) -> None:
         """Soft-delete memories contradicted by `new_id`, recording which memory replaced them."""
         now_ts = self._now().timestamp()
@@ -935,6 +1076,7 @@ class SemanticMemoryStore:
               "version": int(meta.get("version", 1)) + 1} for _, _, meta in old],
         )
         self._bump_stats(user_id, [meta["topic"] for _, _, meta in old], -1)
+        self._bm25_remove(user_id, [mem_id for mem_id, _, _ in old])
         metrics.inc("contradiction.replaced", len(old))
 
     # ----- writes -----------------------------------------------------------
@@ -1001,6 +1143,7 @@ class SemanticMemoryStore:
             if ids:
                 self.backend.add(ids, embs, metas, docs)
                 self._bump_stats(user_id, [m.topic for m in created], +1)
+                self._bm25_add(user_id, zip(ids, docs))
                 # `created` follows item order, so pair each new memory with its item index.
                 for mem, i in zip(created, [i for i, k in enumerate(keep) if k]):
                     if i in contradicted:
@@ -1021,7 +1164,7 @@ class SemanticMemoryStore:
             # Filter by owner and current state so IDs from another user cannot be changed.
             found = self.backend.get(
                 where=_where({"user_id": user_id}, {"deleted": not deleted}),
-                ids=ids, include=("metadatas",),
+                ids=ids, include=("documents", "metadatas"),
             )
             rows = list(zip(found["ids"], found["metadatas"]))
             if not rows:
@@ -1033,6 +1176,10 @@ class SemanticMemoryStore:
                   "version": int(m.get("version", 1)) + 1} for _, m in rows],
             )
             self._bump_stats(user_id, [m["topic"] for _, m in rows], -1 if deleted else +1)
+            if deleted:
+                self._bm25_remove(user_id, [i for i, _ in rows])
+            else:
+                self._bm25_add(user_id, zip(found["ids"], found["documents"]))
         metrics.inc("delete.count" if deleted else "restore.count", len(rows))
         return len(rows)
 
@@ -1062,6 +1209,7 @@ class SemanticMemoryStore:
             if not ids:
                 return 0
             self.backend.delete(ids)
+            self._bm25_remove(user_id, ids)
             # Soft-deleted memories were already taken out of the counts when deleted.
             self._bump_stats(user_id, [m["topic"] for m in expired["metadatas"]], -1)
         metrics.inc("purge.count", len(ids))
@@ -1105,11 +1253,24 @@ class SemanticMemoryStore:
                min_similarity: float = DEFAULT_MIN_SIMILARITY,
                topic_min_similarity: float = DEFAULT_TOPIC_MIN_SIMILARITY,
                use_query_topic: bool = True, cross_topic: bool = True,
-               max_gap: Optional[float] = DEFAULT_MAX_GAP) -> List[Memory]:
+               max_gap: Optional[float] = DEFAULT_MAX_GAP,
+               min_relevance: Optional[float] = None,
+               gate_similarity: Optional[float] = DEFAULT_GATE_SIMILARITY,
+               gate_logit: Optional[float] = DEFAULT_GATE_LOGIT,
+               relevance_gap: Optional[float] = DEFAULT_RELEVANCE_GAP) -> List[Memory]:
         """Return up to k memories, best first.
 
-        Results below `min_similarity` are dropped, so an unrelated query returns nothing
-        rather than filler. When `topic` is not given and `use_query_topic` is on, the
+        Hybrid search (when the store has a reranker): the top RERANK_POOL memories by
+        embedding similarity and by BM25 keyword score are merged with reciprocal rank
+        fusion, then re-scored by the reranker. If neither the best embedding similarity
+        reaches `gate_similarity` nor the best reranker logit reaches `gate_logit`, the
+        question is treated as unrelated to the user and nothing is returned. Memories
+        more than `relevance_gap` logits below the best, or below `min_relevance`, are
+        dropped. The score combines relevance, importance and recency with the alpha weights. Topic blocks and the
+        similarity cutoffs below are not used; `topic` and `memory_type` still filter.
+
+        Classic search (no reranker): results below `min_similarity` are dropped, so an
+        unrelated query returns nothing rather than filler. When `topic` is not given and `use_query_topic` is on, the
         query's own topic is detected; memories in that topic block are also searched
         and need only `topic_min_similarity`.
 
@@ -1132,6 +1293,18 @@ class SemanticMemoryStore:
             conditions.append({"topic": topic})
         if memory_type:
             conditions.append({"memory_type": memory_type})
+        if self.reranker is not None:
+            query_topic = None
+            if topic is None and use_query_topic:
+                detected = self.classifier.classify(query)
+                query_topic = detected if detected != "general" else None
+            results = self._hybrid_search(
+                query, user_id, conditions, k, weights,
+                DEFAULT_MIN_RELEVANCE if min_relevance is None else min_relevance,
+                gate_similarity, gate_logit, relevance_gap, query_topic)
+            metrics.inc("search.count")
+            metrics.observe("search.latency", time.perf_counter() - started)
+            return results
         embedding = [self._embed_query(query).tolist()]
         query_topic = None
         if topic is None and use_query_topic:
@@ -1184,6 +1357,78 @@ class SemanticMemoryStore:
         ranked.sort(key=lambda row: row[0], reverse=True)
         metrics.inc("search.count")
         metrics.observe("search.latency", time.perf_counter() - started)
+        return [mem for _, mem in ranked[:k]]
+
+    def _hybrid_search(self, query: str, user_id: str, conditions: List[dict], k: int,
+                       weights: Tuple[float, float, float], min_relevance: float,
+                       gate_similarity: Optional[float], gate_logit: Optional[float],
+                       relevance_gap: Optional[float], query_topic: Optional[str]) -> List[Memory]:
+        where = _where(*conditions)
+        embedding = [self._embed_query(query).tolist()]
+        dense = self.backend.query(embedding, RERANK_POOL, where)
+        docs: Dict[str, Tuple[str, dict]] = {}
+        dense_ids = []
+        best_similarity = max((_similarity_from_distance(d) for d in _row(dense, "distances", 0)),
+                              default=0.0)
+        for mem_id, doc, meta in zip(_row(dense, "ids", 0), _row(dense, "documents", 0),
+                                     _row(dense, "metadatas", 0)):
+            dense_ids.append(mem_id)
+            docs[mem_id] = (doc, meta)
+
+        # BM25 covers all of the user's active memories; fetch extra in case filters drop some.
+        keyword_ids = [i for i, _ in self._bm25_for(user_id).top(query, RERANK_POOL * 4)]
+        if keyword_ids:
+            found = self.backend.get(where=where, ids=keyword_ids, include=("documents", "metadatas"))
+            allowed = {i: (d, m) for i, d, m in zip(found["ids"], found["documents"], found["metadatas"])}
+            keyword_ids = [i for i in keyword_ids if i in allowed][:RERANK_POOL]
+            docs.update({i: allowed[i] for i in keyword_ids})
+
+        # Topic block: memories filed under the question's topic. They are re-scored like
+        # the rest but skip the answer gate and relative cutoff, because the reranker and
+        # embeddings score them low even when they matter ("Suggest a dinner recipe" vs
+        # "I am allergic to peanuts").
+        block_ids: List[str] = []
+        if query_topic is not None:
+            block = self.backend.query(embedding, RERANK_POOL, _where(*conditions, {"topic": query_topic}))
+            for mem_id, doc, meta in zip(_row(block, "ids", 0), _row(block, "documents", 0),
+                                         _row(block, "metadatas", 0)):
+                block_ids.append(mem_id)
+                docs[mem_id] = (doc, meta)
+
+        fused: Dict[str, float] = {}
+        for ranking in (dense_ids, keyword_ids):
+            for rank, mem_id in enumerate(ranking):
+                fused[mem_id] = fused.get(mem_id, 0.0) + 1.0 / (RRF_K + rank + 1)
+        pool = sorted(fused, key=lambda i: -fused[i])[:RERANK_POOL]
+        pool += [i for i in block_ids if i not in set(pool)]
+        if not pool:
+            return []
+        in_block = np.array([i in set(block_ids) for i in pool])
+        relevance = np.clip(np.asarray(self.reranker(query, [docs[i][0] for i in pool]), dtype=np.float64),
+                            1e-12, 1 - 1e-12)
+        logits = np.log(relevance / (1 - relevance))
+        gated = (gate_similarity is not None and gate_logit is not None
+                 and best_similarity < gate_similarity and logits.max() < gate_logit)
+        if gated:
+            metrics.inc("search.gated")
+        keep = (relevance >= min_relevance) & (not gated)
+        if relevance_gap is not None:
+            keep &= logits >= logits.max() - relevance_gap
+        keep |= in_block
+
+        alpha_relevance, alpha_importance, alpha_recency = weights
+        total = sum(weights)
+        now = self._now()
+        ranked = []
+        for mem_id, rel, kept in zip(pool, relevance, keep):
+            if not kept:
+                continue
+            mem = self._memory(mem_id, *docs[mem_id])
+            recency = 2 ** (-_age_days(mem.timestamp, now) / RECENCY_HALF_LIFE_DAYS)
+            score = (alpha_relevance * float(rel) + alpha_importance * mem.importance
+                     + alpha_recency * recency) / total
+            ranked.append((score, mem))
+        ranked.sort(key=lambda row: row[0], reverse=True)
         return [mem for _, mem in ranked[:k]]
 
     def iter_memories(self, user_id: str, include_deleted: bool = False,

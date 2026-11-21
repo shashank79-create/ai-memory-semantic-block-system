@@ -4,42 +4,59 @@ A long-term memory module for chat assistants, plus a Gemini notebook that uses 
 
 This README reports what the measurements show, including where the original ideas did **not** work.
 
+## 🔎 How search works
+1. **Candidates:** the 50 memories closest in meaning (BGE-small embeddings) and the 50 best keyword matches (BM25) are merged with reciprocal rank fusion.
+2. **Topic block:** memories filed under the question's topic (watches, food, travel, technology; picked by keywords) are added too.
+3. **Reranker:** a cross-encoder (`ms-marco-MiniLM-L-6-v2`) reads the question with each candidate and scores how relevant it is.
+4. **Cutoffs:** if the question matches nothing well (best embedding similarity below 0.6 *and* best reranker score below −9.5), it is treated as unrelated to the user and gets no memories. Memories scoring more than 2 below the best are dropped. Topic-block memories skip both cutoffs.
+5. **Ranking:** relevance, importance and recency combined; the top k are returned.
+
+This replaced the original design (MiniLM embeddings with topic blocks and similarity cutoffs), after the public benchmark below showed it was weaker than plain keyword search. The original is still available as "classic" search (`reranker=None`).
+
 ## 📊 Benchmark: LoCoMo
 [LoCoMo](https://github.com/snap-research/locomo) (Maharana et al., ACL 2024) is a public benchmark for long-term conversational memory: 10 long conversations (5,882 dialogue turns over many sessions) and 1,986 questions, each listing the turns that answer it. Every turn is stored as a memory and each question is used as a search; a method scores when it returns the answering turns. 1,535 questions are scored: category 5 (adversarial, 446 questions) is left out, as in the Mem0 paper's LoCoMo evaluation, and 5 questions have no usable evidence.
 
 Results (`python eval/locomo_benchmark.py`; 95% bootstrap confidence intervals in brackets):
 
-| Method | Recall@5 | Recall@10 | Hit@10 | MRR@10 | ms / question |
-|---|---:|---:|---:|---:|---:|
-| Keyword search (original notebook) | 24.7% (22.6–26.7) | 24.7% (22.6–26.7) | 28.0% | 0.197 | 2.4 |
-| BM25 | 43.4% (41.0–45.9) | 51.0% (48.5–53.5) | 56.6% | 0.353 | 1.8 |
-| MiniLM embeddings | 35.5% (33.2–37.7) | 44.5% (42.2–46.9) | 50.6% | 0.274 | 16.8 |
-| BGE-small embeddings | 48.1% (45.8–50.5) | 58.6% (56.3–60.9) | 65.6% | 0.392 | 28.3 |
-| Hybrid BM25 + BGE (reciprocal rank fusion) | 52.5% (50.1–54.9) | 61.9% (59.5–64.2) | 68.9% | 0.438 | 30.7 |
-| **Hybrid + cross-encoder reranker** | **68.0% (65.8–70.4)** | **73.7% (71.7–75.9)** | **80.5%** | **0.625** | 93.8 |
-| `semantic_memory` default (MiniLM + topic blocks + cutoffs) | 34.1% (31.9–36.4) | 41.9% (39.6–44.3) | 48.0% | 0.269 | 17.6 |
+| Method | Recall@5 | Recall@10 | Hit@10 | MRR@10 |
+|---|---:|---:|---:|---:|
+| Keyword search (original notebook) | 24.7% (22.6–26.7) | 24.7% (22.6–26.7) | 28.0% | 0.197 |
+| `semantic_memory` classic (previous design) | 34.1% (31.9–36.4) | 41.9% (39.6–44.3) | 48.0% | 0.269 |
+| BM25 | 43.4% (41.0–45.9) | 51.0% (48.5–53.5) | 56.6% | 0.353 |
+| MiniLM embeddings | 35.5% (33.2–37.7) | 44.5% (42.2–46.9) | 50.6% | 0.274 |
+| BGE-small embeddings | 48.1% (45.8–50.5) | 58.6% (56.3–60.9) | 65.6% | 0.392 |
+| Hybrid BM25 + BGE | 52.5% (50.1–54.9) | 61.9% (59.5–64.2) | 68.9% | 0.438 |
+| Hybrid + reranker (standalone baseline) | 68.0% (65.8–70.4) | 73.7% (71.7–75.9) | 80.5% | 0.625 |
+| **`semantic_memory`, full ranking** (cutoffs off) | **68.0% (65.8–70.4)** | **73.8% (71.8–76.0)** | **80.6%** | **0.624** |
+| `semantic_memory` default (with cutoffs) | 58.5% (56.2–60.9) | 59.7% (57.3–61.9) | 67.5% | 0.589 |
 
-*Recall@k:* share of the answering turns in the top k results. *Hit@10:* questions with at least one answering turn in the top 10. *MRR@10:* 1 / rank of the first answering turn. Times are on a laptop CPU and include embedding the question.
+*Recall@k:* share of the answering turns in the top k results. *Hit@10:* questions with at least one answering turn in the top 10. *MRR@10:* 1 / rank of the first answering turn. The hybrid searches take about 40–90 ms per question on a laptop CPU, most of it the reranker.
 
-Paired differences in Recall@10 (95% CI):
-- **Topic blocks vs plain MiniLM: +0.0%.** In ranking, topic blocks change nothing; they only matter through the cutoffs. LoCoMo's conversations are about people's lives, so most turns and questions land in the "general" block.
-- **The store's cutoffs vs no cutoffs: −2.6% (−3.4 to −1.8).** The cutoffs that keep unrelated memories out also drop some relevant ones.
-- **BGE-small vs MiniLM: +14.1% (+12.0 to +16.2).** The embedding model matters more than anything else in the store.
-- **Reranker vs hybrid: +11.8% (+10.1 to +13.6).** Re-scoring the top 50 with a cross-encoder is the largest single gain, at ~60 ms extra per question.
-
-What this means:
-- **The current store is not competitive.** It finds fewer answering turns than plain BM25 keyword ranking, and 32 points fewer than BM25 + BGE + reranker.
-- **The original topic-block idea gives no measurable benefit on a public benchmark.** It helped on my small hand-written test (below), where questions are about watches and food, but not on real long conversations.
-- **What works is well known:** a stronger embedding model, hybrid keyword + embedding search, and a reranker.
-- These are **retrieval** scores. Published LoCoMo results such as Mem0's measure whether an LLM's final *answer* is correct (judged by another LLM), so they are not directly comparable. Answer accuracy with Gemini has not been measured here.
+What this shows:
+- **The rebuilt search finds 74% of answering turns in its top 10, up from 42%** (+31.9 points), matching the best standalone baseline.
+- **The default cutoffs trade recall for focus.** They return about 3 turns per question instead of 10, which costs 14 points of Recall@10 (−14.2%, CI −15.8 to −12.6). Pass `relevance_gap=None` to get the full ranking. The answer gate itself rejected none of LoCoMo's questions (all of them are about the user).
+- **What mattered, measured one step at a time** (paired differences in Recall@10): BGE-small instead of MiniLM +14.1% (+12.0 to +16.2); adding BM25 +3.3% (+1.3 to +5.5); the reranker +11.8% (+10.1 to +13.6).
+- **Topic blocks don't change ranking on LoCoMo** (+0.0%): its conversations are about people's lives, so almost everything is "general". Their value is in the cutoffs, for an assistant whose memories fall into clear topics (see the next section and the notebook).
+- These are **retrieval** scores. Published LoCoMo results such as Mem0's measure whether an LLM's final *answer* is correct (judged by another LLM), so they are not directly comparable. Answer accuracy with Gemini has not been measured.
 - Confidence intervals resample questions; questions from the same conversation are related, so the true uncertainty is somewhat larger.
 
 ## 🧪 Small hand-written test
-Before the public benchmark, I wrote two small question sets in `eval/` (36 and 29 memories, 47 and 38 questions), including unrelated questions that should get no memories. They were used to choose the store's cutoffs (`python eval/retrieval_eval.py`). On the held-out set, the store found 77% of relevant memories (original keyword search: 40%) and returned nothing for all 7 unrelated questions (original: 0 of 7).
+LoCoMo only checks whether answering turns are found. It doesn't check whether search returns *nothing* for questions unrelated to the user, or how much irrelevant material comes back. Two small hand-written sets in `eval/` measure that (36 and 29 memories, 47 and 38 questions, including unrelated ones like "Who wrote Hamlet?"). Settings were chosen on the first set (`python eval/retrieval_eval.py --sweep-hybrid`); results on the second (held-out) set:
 
-Treat these numbers with caution: the sets are small (results can move by ±15 points), I wrote both the questions and the system, and the memories are short, tidy sentences. LoCoMo is the more reliable measure. One thing the small test measures that LoCoMo doesn't: whether *unrelated* questions get no memories, which is what the cutoffs are for.
+| Method | Recall | Precision | Rejects unrelated | Overall |
+|---|---:|---:|---:|---:|
+| Keyword search (original notebook) | 40% | 18% | 0% | 20% |
+| Classic (previous design) | 77% | 68% | 100% | 77% |
+| Hybrid, no cutoffs | 86% | 25% | 0% | 31% |
+| **Hybrid with cutoffs (default)** | 77% | 50% | 100% | 68% |
 
-An experiment from this test, kept as a negative result: picking topics by meaning (`EmbeddingTopicClassifier`) sorted topics slightly more accurately than keywords (78% vs 75%) but made search worse (67% vs 74% overall on the tuning set), so keywords stay the default.
+*Recall:* share of relevant memories returned (up to 5). *Precision:* share of returned memories that were relevant. *Overall:* F1 of recall and precision, combined with rejection.
+
+- **On this small test, the classic design is still better** (77% vs 68% overall): the hybrid search returns more irrelevant memories (50% precision vs 68%). The reranker is trained on web search and gives short personal facts low, poorly calibrated scores, which makes good cutoffs hard.
+- **Without cutoffs, every unrelated question gets memories.** The answer gate fixes that here and costs nothing on LoCoMo.
+- **Treat these numbers with caution:** the sets are small (results can move by ±15 points), I wrote both the questions and the system, and while building the hybrid search I looked at held-out results more than once, so that set is no longer fully blind.
+
+Earlier experiments from this test, kept as negative results: picking topics by meaning (`EmbeddingTopicClassifier`) sorted topics slightly more accurately than keywords (78% vs 75%) but made classic search worse (67% vs 74% overall on the tuning set); and on LoCoMo, topic blocks gave no ranking gain.
 
 ## ⏱️ Speed
 `python benchmark.py` times one search over N memories (laptop CPU, excluding the ~15 ms to embed the question):
@@ -57,7 +74,7 @@ An experiment from this test, kept as a negative result: picking topics by meani
 ## 🛠️ Built With
 - Python
 - Google Gemini AI
-- SentenceTransformers (MiniLM embeddings, NLI contradiction model)
+- SentenceTransformers (BGE-small embeddings, ms-marco cross-encoder reranker, NLI contradiction model)
 - NumPy + SQLite (topic-block index); ChromaDB optional
 - Jupyter Notebook
 
@@ -72,18 +89,19 @@ An experiment from this test, kept as a negative result: picking topics by meani
 ## 🎯 How to Use
 1. Get a free Gemini API key from [aistudio.google.com](https://aistudio.google.com)
 2. Open the notebook in Jupyter (from this folder, so it can import `semantic_memory.py`)
-3. Run all cells and start chatting! The first cell installs the packages, and the first run downloads two models: the embedding model (about 90 MB) and the contradiction model (about 300 MB).
+3. Run all cells and start chatting! The first cell installs the packages, and the first run downloads four models: BGE-small embeddings (about 130 MB), the reranker (about 90 MB), the contradiction model (about 300 MB) and, for classic search only, MiniLM (about 90 MB).
 4. Save lasting facts with `assistant.remember("...")` and chat with `assistant.chat("...")`. Memories are kept in the `memory/` folder between sessions.
 
 ## 🧠 Semantic Memory Store (`semantic_memory.py`)
 A standalone memory module that replaces the notebook's keyword search with embeddings.
 
-- **Embeddings + topic-block index:** SentenceTransformers (`all-MiniLM-L6-v2`) vectors, kept in one in-memory matrix per (user, topic) block and saved in SQLite (`memory/memories.db`). All memories are loaded at startup (about 150 MB per 100,000 memories). `ChromaBackend` is still available for much larger stores.
-- **Topic blocks:** topics are detected from keywords (plurals included). A search also looks inside the question's topic block, and memories there pass a lower similarity cutoff. This helped on the small hand-written test but made no difference on LoCoMo (see above).
+- **Hybrid search:** BGE-small embeddings + BM25 keyword index + cross-encoder reranker (see "How search works" above). `reranker=None` switches to classic search.
+- **Storage:** vectors are kept in one in-memory matrix per (user, topic) block and saved in SQLite (`memory/memories.db`). All memories are loaded at startup (about 150 MB per 100,000 memories). The BM25 index is rebuilt from the store on first search. `ChromaBackend` is still available for much larger stores.
+- **Topic blocks:** topics are detected from keywords (plurals included). A search also looks inside the question's topic block, and memories there skip the cutoffs.
 - **Duplicates:** restating something refreshes the stored memory (time, importance, version) instead of adding a copy.
 - **Expiry:** only episodic memories (events) expire, after 90 days by default. Semantic memories (lasting facts) stay until deleted. Deleted memories can be restored for 7 days, then `purge_expired` removes them for good.
-- **Contradictions (optional):** pass `contradiction_checker=NLIContradictionChecker()` and a new memory that contradicts a very similar stored one replaces it ("I am not allergic to peanuts" replaces "I am allergic to peanuts"). The replaced memory is soft-deleted, so it can be restored for 7 days. The model alone would call "I love pizza" vs "I love sushi" a contradiction, so only pairs with similarity of at least 0.80 are checked. Changes worded very differently ("I live in Delhi" → "I moved to Mumbai") are missed.
-- **Ranking:** similarity, importance and recency. A minimum similarity (0.3, or 0.1 inside the question's topic block) and a relative cutoff keep unrelated memories out.
+- **Contradictions (optional):** pass `contradiction_checker=NLIContradictionChecker()` and a new memory that contradicts a very similar stored one replaces it ("I am not allergic to peanuts" replaces "I am allergic to peanuts"). The replaced memory is soft-deleted, so it can be restored for 7 days. The model alone would call "I love pizza" vs "I love sushi" or "I have a dog" vs "I have a cat" contradictions, so only pairs with BGE similarity of at least 0.90 are checked. That avoids deleting compatible facts but misses many real contradictions ("I love my Rolex" → "I hate my Rolex" scores 0.815), as well as changes worded very differently ("I live in Delhi" → "I moved to Mumbai").
+- **Ranking:** reranker relevance, importance and recency.
 - **Context:** `MemorySession.build_context` fits long-term memories and recent messages into a token budget.
 
 ```bash
@@ -92,12 +110,12 @@ python semantic_memory.py          # small demo
 python -m pytest test_semantic_memory.py
 python benchmark.py
 python eval/retrieval_eval.py
-python eval/locomo_benchmark.py   # also downloads BGE-small and a reranker (~220 MB)
+python eval/locomo_benchmark.py   # downloads the LoCoMo dataset (2.8 MB) on first run
 ```
 
 Every store test runs on three backends: an in-memory stand-in, the topic-block backend and real ChromaDB. More tests use the real MiniLM and NLI models to check search, duplicates and contradictions. Tests needing ChromaDB or the models are skipped when those aren't available.
 
-The search cutoffs come from the small hand-written test. The duplicate threshold (0.985) was set from measured MiniLM scores. For example, "I am not allergic to peanuts" scores 0.970 against "I am allergic to peanuts", so it isn't treated as a duplicate.
+The search cutoffs come from the small hand-written test. The duplicate threshold (0.96) was set from measured BGE scores: rewordings like "I really love my Rolex" score 0.97–1.0, while "I am not allergic to peanuts" scores 0.923 against "I am allergic to peanuts", so it isn't treated as a duplicate.
 
 ## 📫 Connect With Me
 - LinkedIn: [https://www.linkedin.com/in/shashank-yadav-142a42336]
