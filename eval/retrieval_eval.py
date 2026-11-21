@@ -39,7 +39,8 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from semantic_memory import BlockIndexBackend, SemanticMemoryStore  # noqa: E402
+from semantic_memory import (  # noqa: E402
+    BGE_QUERY_PREFIX, BlockIndexBackend, CrossEncoderReranker, SemanticMemoryStore)
 
 K = 5
 SETS = {"tuning": "dataset.json", "test": "test_set.json"}
@@ -104,26 +105,38 @@ def score(results: dict, queries: list) -> dict:
 class Bench:
     """One set's memories in a real store, with every method available."""
 
-    def __init__(self, name: str, model, classifier: str = "keyword"):
+    def __init__(self, name: str, model, classifier: str = "keyword", bge=None, reranker=None):
         data = json.loads((ROOT / "eval" / SETS[name]).read_text(encoding="utf-8"))
         self.memories, self.queries = data["memories"], data["queries"]
         for q in self.queries:
             assert all(m in self.memories for m in q["relevant"]), q
         self.model = model
         self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        # Classic store: MiniLM, topic blocks and cutoffs (the previous default).
         self.store = SemanticMemoryStore(storage_path=self._tmp.name, embedder=model,
                                          backend=BlockIndexBackend(f"{self._tmp.name}/memories.db"),
-                                         topic_classifier=classifier)
+                                         topic_classifier=classifier, reranker=None)
         text_to_id = {text: mem_id for mem_id, text in self.memories.items()}
         stored = self.store.add_many(
             [{"content": t, "skip_duplicates": False} for t in self.memories.values()], "u")
         self.store_id = {m.id: text_to_id[m.content] for m in stored}
         self.topics = {text_to_id[m.content]: m.topic for m in stored}
+        # Hybrid store: BGE + BM25 + reranker (the current default).
+        self.hybrid = None
+        if bge is not None and reranker is not None:
+            self.hybrid = SemanticMemoryStore(storage_path=f"{self._tmp.name}/hybrid", embedder=bge,
+                                              backend=BlockIndexBackend(f"{self._tmp.name}/hybrid.db"),
+                                              reranker=reranker, query_prefix=BGE_QUERY_PREFIX)
+            stored = self.hybrid.add_many(
+                [{"content": t, "skip_duplicates": False} for t in self.memories.values()], "u")
+            self.hybrid_id = {m.id: text_to_id[m.content] for m in stored}
         self.mem_ids = list(self.memories)
         self.mem_vecs = model.encode([self.memories[m] for m in self.mem_ids], normalize_embeddings=True)
 
     def close(self):
         self.store.backend.close()
+        if self.hybrid is not None:
+            self.hybrid.backend.close()
         self._tmp.cleanup()
 
     def top_k_embedding(self, query: str) -> list:
@@ -133,16 +146,22 @@ class Bench:
     def via_store(self, **options):
         return lambda query: [self.store_id[m.id] for m in self.store.search(query, "u", k=K, **options)]
 
+    def via_hybrid(self, **options):
+        return lambda query: [self.hybrid_id[m.id] for m in self.hybrid.search(query, "u", k=K, **options)]
+
     def run(self, fn) -> dict:
         return {q["q"]: fn(q["q"]) for q in self.queries}
 
     def methods(self) -> dict:
         return {
             "Keyword search (original notebook)": keyword_method(self.memories),
-            "Embeddings, top 5 (no cutoff)": self.top_k_embedding,
-            "Embeddings + similarity cutoff": self.via_store(use_query_topic=False),
-            "Embeddings + topic blocks (default)": self.via_store(),
-            "Topic blocks, block-only": self.via_store(cross_topic=False),
+            "MiniLM, top 5 (no cutoff)": self.top_k_embedding,
+            "Classic: MiniLM + similarity cutoff": self.via_store(use_query_topic=False),
+            "Classic: MiniLM + topic blocks (previous default)": self.via_store(),
+            "Classic: topic blocks, block-only": self.via_store(cross_topic=False),
+            **({"Hybrid BM25 + BGE + reranker, no gate": self.via_hybrid(
+                    gate_similarity=None, gate_logit=None, relevance_gap=None),
+                "Hybrid + reranker + gate (current default)": self.via_hybrid()} if self.hybrid else {}),
         }
 
 
@@ -188,9 +207,30 @@ def sweep(bench: Bench):
               + " | ".join(fmt(m, s[m]) for m in METRICS) + " |")
 
 
+def sweep_hybrid(bench: Bench):
+    grid = itertools.product([None, 0.5, 0.53, 0.56, 0.6],   # gate_similarity
+                             [None, -10.0, -9.5, -9.0, -8.0],   # gate_logit
+                             [None, 2.0, 4.0, 6.0, 8.0])         # relevance_gap
+    rows = []
+    for gs, gl, gap in grid:
+        if (gs is None) != (gl is None):
+            continue  # the gate needs both bars, or neither
+        options = {"gate_similarity": gs, "gate_logit": gl, "relevance_gap": gap}
+        rows.append((score(bench.run(bench.via_hybrid(**options)), bench.queries), options))
+    rows.sort(key=lambda r: -r[0]["overall"])
+    print("Hybrid search settings on the tuning set:\n")
+    print("| gate_similarity | gate_logit | relevance_gap | " + " | ".join(METRICS) + " |")
+    print("|---:|---:|---:|" + "---:|" * len(METRICS))
+    for s, o in rows[:15]:
+        print(f"| {o['gate_similarity']} | {o['gate_logit']} | {o['relevance_gap']} | "
+              + " | ".join(fmt(m, s[m]) for m in METRICS) + " |")
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sweep", action="store_true", help="try search settings on the tuning set")
+    parser.add_argument("--sweep", action="store_true", help="try classic search settings on the tuning set")
+    parser.add_argument("--sweep-hybrid", action="store_true",
+                        help="try hybrid search gate and cutoff settings on the tuning set")
     parser.add_argument("--set", choices=list(SETS), help="only this question set")
     parser.add_argument("--show-misses", metavar="METHOD", help="list questions this method got wrong")
     parser.add_argument("--classifier", choices=["keyword", "embedding"], default="keyword",
@@ -199,7 +239,14 @@ def main():
 
     from sentence_transformers import SentenceTransformer
     model = SentenceTransformer("all-MiniLM-L6-v2")
+    bge = SentenceTransformer("BAAI/bge-small-en-v1.5")
+    reranker = CrossEncoderReranker()
 
+    if args.sweep_hybrid:
+        bench = Bench("tuning", model, args.classifier, bge, reranker)
+        sweep_hybrid(bench)
+        bench.close()
+        return
     if args.sweep:
         bench = Bench("tuning", model, args.classifier)
         sweep(bench)
@@ -207,7 +254,7 @@ def main():
         return
 
     for name in [args.set] if args.set else list(SETS):
-        bench = Bench(name, model, args.classifier)
+        bench = Bench(name, model, args.classifier, bge, reranker)
         answerable = sum(1 for q in bench.queries if q["relevant"])
         print(f"\n## {name} set: {len(bench.memories)} memories, {answerable} answerable questions, "
               f"{len(bench.queries) - answerable} unrelated, k={K}")
