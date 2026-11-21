@@ -3,3 +3,4 @@ __pycache__/
 memory/
 memory_data/
 .ipynb_checkpoints/
+eval/data/
