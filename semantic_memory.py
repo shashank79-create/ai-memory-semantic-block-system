@@ -73,7 +73,11 @@ RRF_K = 60         # reciprocal rank fusion constant
 DEFAULT_GATE_SIMILARITY: Optional[float] = 0.6
 DEFAULT_GATE_LOGIT: Optional[float] = -9.5
 # - Relative cutoff: drop memories whose reranker logit is more than this below the best.
-DEFAULT_RELEVANCE_GAP: Optional[float] = 2.0
+#   Off by default: on LoCoMo a gap of 2.0 kept ~3 memories per question and cost 14.2
+#   points of Recall@10, while the gate alone lost nothing there and still rejected every
+#   unrelated question in both hand-written sets. Set it (e.g. 2.0) for fewer, more
+#   precise memories.
+DEFAULT_RELEVANCE_GAP: Optional[float] = None
 DEFAULT_MIN_RELEVANCE = 0.0  # absolute cutoff on reranker relevance (0-1); off by default
 # Cosine similarity at or above this counts as a duplicate. Measured with BGE-small:
 # punctuation/case changes and "I really love X" score 0.97-1.0, while "I am allergic to

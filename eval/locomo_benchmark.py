@@ -168,12 +168,13 @@ def main():
 
     methods = ["Keyword search (original notebook)", "BM25", "MiniLM", "BGE-small",
                "Hybrid BM25 + BGE", "Hybrid + reranker",
-               "semantic_memory default", "semantic_memory hybrid, no gate",
+               "semantic_memory default", "semantic_memory with gap 2.0", "semantic_memory hybrid, no gate",
                "semantic_memory classic", "semantic_memory classic, ranking only"]
     per_q = {m: [] for m in methods}           # metric dicts, one per question
     timings = {m: [] for m in methods}         # seconds per question
     questions = []                             # (sample_id, category, question)
     returned_counts = []                       # turns returned by the store's default search
+    gap_counts = []                            # turns returned with the gap turned on
     skipped = Counter()
 
     for sample in data:
@@ -253,6 +254,9 @@ def main():
             timed("Hybrid + reranker", do_rerank)
             timed("semantic_memory default", lambda: [
                 to_dia[m.id] for m in hybrid_store.search(question, "u", k=10)])
+            timed("semantic_memory with gap 2.0", lambda: [
+                to_dia[m.id] for m in hybrid_store.search(question, "u", k=10, relevance_gap=2.0)])
+            gap_counts.append(len(out["semantic_memory with gap 2.0"]))
             timed("semantic_memory hybrid, no gate", lambda: [
                 to_dia[m.id] for m in hybrid_store.search(question, "u", k=10, gate_similarity=None,
                                                           gate_logit=None, relevance_gap=None)])
@@ -304,7 +308,8 @@ def main():
 
     print("\nPaired differences in Recall@10 (95% CI; an interval excluding 0 is a real difference):\n")
     pairs = [("semantic_memory default", "semantic_memory classic", "New default vs previous default (classic)"),
-             ("semantic_memory default", "semantic_memory hybrid, no gate", "Gate + relative cutoff vs none"),
+             ("semantic_memory default", "semantic_memory hybrid, no gate", "Gate vs no gate"),
+             ("semantic_memory with gap 2.0", "semantic_memory default", "Gap 2.0 on top of the gate"),
              ("semantic_memory hybrid, no gate", "Hybrid + reranker", "Store's hybrid vs the standalone baseline"),
              ("semantic_memory classic, ranking only", "MiniLM", "Topic blocks vs plain MiniLM"),
              ("semantic_memory classic", "semantic_memory classic, ranking only", "Classic cutoffs vs none"),
@@ -321,6 +326,8 @@ def main():
     avg_returned = statistics.mean(returned_counts)
     print(f"\nsemantic_memory default returned {avg_returned:.1f} turns per question on average "
           f"(others always return 10); {sum(1 for c in returned_counts if c == 0)} questions got none.")
+    print(f"With gap 2.0: {statistics.mean(gap_counts):.1f} turns on average; "
+          f"{sum(1 for c in gap_counts if c == 0)} questions got none.")
     RESULTS.parent.mkdir(parents=True, exist_ok=True)
     RESULTS.write_text(json.dumps({"questions": n, "skipped": dict(skipped), "summary": summary,
                                    "recall10_by_category": by_cat, "paired_recall10_diffs": diffs},
