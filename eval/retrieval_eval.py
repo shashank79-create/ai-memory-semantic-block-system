@@ -161,7 +161,8 @@ class Bench:
             "Classic: topic blocks, block-only": self.via_store(cross_topic=False),
             **({"Hybrid BM25 + BGE + reranker, no gate": self.via_hybrid(
                     gate_similarity=None, gate_logit=None, relevance_gap=None),
-                "Hybrid + reranker + gate (current default)": self.via_hybrid()} if self.hybrid else {}),
+                "Hybrid + reranker + gate (default)": self.via_hybrid(),
+                "Hybrid + reranker + gate + gap 2.0": self.via_hybrid(relevance_gap=2.0)} if self.hybrid else {}),
         }
 
 

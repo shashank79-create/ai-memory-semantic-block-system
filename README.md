@@ -8,7 +8,8 @@ This README reports what the measurements show, including where the original ide
 1. **Candidates:** the 50 memories closest in meaning (BGE-small embeddings) and the 50 best keyword matches (BM25) are merged with reciprocal rank fusion.
 2. **Topic block:** memories filed under the question's topic (watches, food, travel, technology; picked by keywords) are added too.
 3. **Reranker:** a cross-encoder (`ms-marco-MiniLM-L-6-v2`) reads the question with each candidate and scores how relevant it is.
-4. **Cutoffs:** if the question matches nothing well (best embedding similarity below 0.6 *and* best reranker score below −9.5), it is treated as unrelated to the user and gets no memories. Memories scoring more than 2 below the best are dropped. Topic-block memories skip both cutoffs.
+4. **Answer gate:** if the question matches nothing well (best embedding similarity below 0.6 *and* best reranker score below −9.5), it is treated as unrelated to the user and gets no memories. Topic-block memories skip the gate.
+   An optional relative cutoff (`relevance_gap`, off by default) also drops memories scoring far below the best; it returns fewer, more precise memories but misses more (see below).
 5. **Ranking:** relevance, importance and recency combined; the top k are returned.
 
 This replaced the original design (MiniLM embeddings with topic blocks and similarity cutoffs), after the public benchmark below showed it was weaker than plain keyword search. The original is still available as "classic" search (`reranker=None`).
@@ -27,33 +28,37 @@ Results (`python eval/locomo_benchmark.py`; 95% bootstrap confidence intervals i
 | BGE-small embeddings | 48.1% (45.8–50.5) | 58.6% (56.3–60.9) | 65.6% | 0.392 |
 | Hybrid BM25 + BGE | 52.5% (50.1–54.9) | 61.9% (59.5–64.2) | 68.9% | 0.438 |
 | Hybrid + reranker (standalone baseline) | 68.0% (65.8–70.4) | 73.7% (71.7–75.9) | 80.5% | 0.625 |
-| **`semantic_memory`, full ranking** (cutoffs off) | **68.0% (65.8–70.4)** | **73.8% (71.8–76.0)** | **80.6%** | **0.624** |
-| `semantic_memory` default (with cutoffs) | 58.5% (56.2–60.9) | 59.7% (57.3–61.9) | 67.5% | 0.589 |
+| **`semantic_memory` default** (hybrid + answer gate) | **68.0% (65.8–70.4)** | **73.8% (71.8–76.0)** | **80.6%** | **0.624** |
+| `semantic_memory` with `relevance_gap=2.0` | 58.5% (56.2–60.9) | 59.7% (57.3–61.9) | 67.5% | 0.589 |
 
 *Recall@k:* share of the answering turns in the top k results. *Hit@10:* questions with at least one answering turn in the top 10. *MRR@10:* 1 / rank of the first answering turn. The hybrid searches take about 40–90 ms per question on a laptop CPU, most of it the reranker.
 
 What this shows:
 - **The rebuilt search finds 74% of answering turns in its top 10, up from 42%** (+31.9 points), matching the best standalone baseline.
-- **The default cutoffs trade recall for focus.** They return about 3 turns per question instead of 10, which costs 14 points of Recall@10 (−14.2%, CI −15.8 to −12.6). Pass `relevance_gap=None` to get the full ranking. The answer gate itself rejected none of LoCoMo's questions (all of them are about the user).
+- **The answer gate costs nothing here** (+0.0% vs no gate): it rejected none of LoCoMo's questions, which are all about the user.
+- **The relative cutoff is what cost recall.** An earlier default combined the gate with `relevance_gap=2.0`; it returned about 3 turns per question and lost 14.2 points of Recall@10 (CI −15.8 to −12.6). Testing the gate and the gap separately (suggested in a review) showed the gate alone keeps full recall, so the gap is now off by default.
 - **What mattered, measured one step at a time** (paired differences in Recall@10): BGE-small instead of MiniLM +14.1% (+12.0 to +16.2); adding BM25 +3.3% (+1.3 to +5.5); the reranker +11.8% (+10.1 to +13.6).
 - **Topic blocks don't change ranking on LoCoMo** (+0.0%): its conversations are about people's lives, so almost everything is "general". Their value is in the cutoffs, for an assistant whose memories fall into clear topics (see the next section and the notebook).
 - These are **retrieval** scores. Published LoCoMo results such as Mem0's measure whether an LLM's final *answer* is correct (judged by another LLM), so they are not directly comparable. Answer accuracy with Gemini has not been measured.
 - Confidence intervals resample questions; questions from the same conversation are related, so the true uncertainty is somewhat larger.
 
 ## 🧪 Small hand-written test
-LoCoMo only checks whether answering turns are found. It doesn't check whether search returns *nothing* for questions unrelated to the user, or how much irrelevant material comes back. Two small hand-written sets in `eval/` measure that (36 and 29 memories, 47 and 38 questions, including unrelated ones like "Who wrote Hamlet?"). Settings were chosen on the first set (`python eval/retrieval_eval.py --sweep-hybrid`); results on the second (held-out) set:
+LoCoMo only checks whether answering turns are found. It doesn't check whether search returns *nothing* for questions unrelated to the user, or how much irrelevant material comes back. Two small hand-written sets in `eval/` measure that (36 and 29 memories, 47 and 38 questions, including unrelated ones like "Who wrote Hamlet?"). The gate's settings were chosen on the first set (`python eval/retrieval_eval.py --sweep-hybrid`); results on the second (held-out) set:
 
 | Method | Recall | Precision | Rejects unrelated | Overall |
 |---|---:|---:|---:|---:|
 | Keyword search (original notebook) | 40% | 18% | 0% | 20% |
 | Classic (previous design) | 77% | 68% | 100% | 77% |
-| Hybrid, no cutoffs | 86% | 25% | 0% | 31% |
-| **Hybrid with cutoffs (default)** | 77% | 50% | 100% | 68% |
+| Hybrid, no gate | 86% | 25% | 0% | 31% |
+| **Hybrid + answer gate (default)** | 81% | 24% | 100% | 49% |
+| Hybrid + gate + `relevance_gap=2.0` | 77% | 50% | 100% | 68% |
 
 *Recall:* share of relevant memories returned (up to 5). *Precision:* share of returned memories that were relevant. *Overall:* F1 of recall and precision, combined with rejection.
 
-- **On this small test, the classic design is still better** (77% vs 68% overall): the hybrid search returns more irrelevant memories (50% precision vs 68%). The reranker is trained on web search and gives short personal facts low, poorly calibrated scores, which makes good cutoffs hard.
-- **Without cutoffs, every unrelated question gets memories.** The answer gate fixes that here and costs nothing on LoCoMo.
+- **The answer gate does its job:** all 7 unrelated questions get no memories (without it, all 7 get some), and it costs nothing on LoCoMo.
+- **The default returns its full top 5, so precision is low** (24%): with few memories stored, relevant ones come first and less relevant ones follow (in the notebook, "Which watch should I buy?" gets both watch facts, then two food facts). For an LLM prompt that is usually harmless, and it is the price of the 14 points of LoCoMo recall. `relevance_gap=2.0` doubles precision (50%) if fewer memories matter more than missing some.
+- **On precision, the classic design is still better** (68%). The reranker is trained on web search and gives short personal facts low, poorly calibrated scores, which makes a precise cutoff hard.
+- *Overall* weighs precision heavily; it is a summary I defined for this test, not a standard metric.
 - **Treat these numbers with caution:** the sets are small (results can move by ±15 points), I wrote both the questions and the system, and while building the hybrid search I looked at held-out results more than once, so that set is no longer fully blind.
 
 Earlier experiments from this test, kept as negative results: picking topics by meaning (`EmbeddingTopicClassifier`) sorted topics slightly more accurately than keywords (78% vs 75%) but made classic search worse (67% vs 74% overall on the tuning set); and on LoCoMo, topic blocks gave no ranking gain.
